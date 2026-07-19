@@ -14,7 +14,7 @@ Pi OS / Debian 13), with a **USB webcam** + **YDLIDAR X2**.
 |---|---|
 | `ros2-package/sign_detector/` | The ROS 2 package that runs on the robot — HSV + YOLO detectors, the fusion node (`vision_msgs/Detection3DArray` + RViz markers), launch files, and the `docker/` build (Dockerfile, compose, bringup launch with the X2 driver). **This is the deliverable that's deployed to the Pi.** |
 | `dataset/` | `wro_dataset/` — auto-labeled YOLO dataset from the training photos (102 labeled, 86 red + 78 green boxes), plus `wro_dataset.zip` for Roboflow. |
-| `training-images/` | 142 real photos of the practice blocks (+ original zip). |
+| `training-images/` | 142 real photos of the practice blocks (+ original zip). **Not included here** — ~2 GB, shared separately. |
 | `prototyping/` | `WRO_sign_detector.ipynb` (Colab: YOLO11n on synthetic data → NCNN/TFLite), `red_green_test.py` (minimal standalone HSV tester), and dev/diagnostic images. |
 | `screenshots/` | Live detection results off the Pi, plus `detection_gallery.html` (open in a browser). |
 | `rules/` | The official WRO 2026 FE rules PDF. |
