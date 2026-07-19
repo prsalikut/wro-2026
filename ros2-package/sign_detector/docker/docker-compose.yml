@@ -1,0 +1,16 @@
+services:
+  sign_detector:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sign_detector:humble
+    container_name: sign_detector
+    network_mode: host
+    ipc: host
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - ../:/ros2_ws/src/sign_detector
+    environment:
+      - ROS_DOMAIN_ID=0
+    restart: unless-stopped
