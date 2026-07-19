@@ -9,8 +9,8 @@ training-images/
 dataset/wro_dataset.zip
 *.zip
 
-done
-Pi:8080
+done
+Pi8080
 
 .vscode/
 .idea/
