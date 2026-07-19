@@ -1,0 +1,52 @@
+sign_detector:
+  ros__parameters:
+    detector: "cnn"
+    profile: "lab"
+    weights: "/home/pi/models/block_detection_model.tflite"
+    conf: 0.4
+    imgsz: 320
+
+    cnn_chroma_min: 28.0
+    cnn_conf_min: 0.60
+    cnn_input_size: 64
+
+    hfov_deg: 60.0
+    sign_height_m: 0.093
+
+    image_topic: "/image_raw"
+    scan_topic: "/scan"
+    target_frame: "base_link"
+
+    lidar_dx: -0.195
+    angle_sign: 1.0
+    angle_offset_deg: -93.7
+    search_window_deg: 10.0
+    match_tol_m: 0.25
+    max_range_m: 2.0
+
+    mono_smooth_n: 5
+    fused_smooth_n: 3
+
+    publish_debug: true
+
+steering_bridge:
+  ros__parameters:
+    port: "auto"
+    baud: 115200
+
+    steer_dir: 1.0
+    max_deg: 25.0
+    rate_limit_dps: 0.0
+    cmd_timeout_s: 1.0
+    drive_max_pct: 70.0
+    center_on_shutdown: true
+
+sign_steering:
+  ros__parameters:
+    engage_range_m: 1.2
+    full_deflection_deg: 25.0
+    full_range_m: 0.6
+    min_scale: 0.4
+    clear_center_s: 0.7
+    drive_cruise_pct: 55.0
+    slow_factor: 0.9

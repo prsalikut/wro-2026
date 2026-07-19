@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.ino text eol=lf
+Dockerfile text eol=lf
+
+*.jpg binary
+*.jpeg binary
+*.JPG binary
+*.png binary
+*.pdf binary
+*.zip binary
+*.tflite binary
+*.pt binary
