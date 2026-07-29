@@ -702,6 +702,13 @@ def rc_engage():
     still (drive 0) until the operator holds the deadman AND pushes throttle."""
     autonomy_stop()
     node = NODE["n"]
+    # Arm the firmware drive deadman: RC streams M at 20 Hz, so 400 ms is a wide
+    # margin, and it closes the hole where the bridge's manual keepalive PINGs
+    # feed the 1 s watchdog while nobody is actually asking for throttle.
+    # MUST precede RESUME: send_raw opens a 30 s manual window that suspends
+    # steering_cmd/drive_cmd forwarding, and RC drives through those topics.
+    # RESUME closes that window again.
+    node.send_raw("DWD 400", wait=1.0)
     node.send_raw("RESUME", wait=1.0)
     with LOCK:
         RC["active"] = True
@@ -747,7 +754,13 @@ def rc_release():
         RC["steer"] = 0.0
         RC["drive"] = 0.0
     node.rc_publish(0.0, 0.0)
-    log_event("rc", "RC released (motor stop, disarmed)")
+    # Disarm the drive deadman again, else a later autonomy run trips it: that
+    # path only refreshes M every 2 s (steering_node: d_refresh >= 2.0), which a
+    # 400 ms deadman would chop continuously. RESUME re-closes the manual window
+    # that the raw DWD just opened.
+    node.send_raw("DWD 0", wait=1.0)
+    node.send_raw("RESUME", wait=1.0)
+    log_event("rc", "RC released (motor stop, disarmed, drive deadman off)")
     return {"ok": True}
 
 
@@ -1048,10 +1061,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "err": "empty"}, 400); return
             parts = cmd.split()
             verb = parts[0].upper()
-            if verb in ("WD", "RESUME"):
+            if verb in ("WD", "DWD", "RESUME"):
                 self._json({"ok": False,
-                            "err": "WD/RESUME not allowed here (WD is the failsafe; "
-                                   "use the resume button)"}, 403); return
+                            "err": "WD/DWD/RESUME not allowed here (they are the "
+                                   "failsafes; DWD is armed by RC engage, and "
+                                   "RESUME has its own button)"}, 403); return
             if verb == "M":
                 try:
                     v = float(parts[1]) if len(parts) > 1 else 0.0

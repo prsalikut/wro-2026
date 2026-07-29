@@ -54,16 +54,43 @@ needs roughly **>=40-50% duty to start** -- the validated bench value is ~59%
 
 | Command             | Reply                                          | Notes |
 |---------------------|------------------------------------------------|-------|
-| `PING`              | `PONG steering-fw v1`                           | liveness check |
+| `PING`              | `PONG steering-fw v2`                           | liveness check |
 | `S <deg>`           | `OK S <applied_deg>`                             | signed deg from center (float ok), clamped to `LIM` |
 | `U <us>`            | `OK U <us>`                                      | raw pulse, clamped `[850,2150]`; **calibration only** |
 | `C`                 | `OK C`                                           | center (deg 0 + trim) |
 | `LIM <left> <right>`| `OK LIM <l> <r>`                                 | positive magnitudes = max LEFT / max RIGHT; default `25 25`, args capped at 25 |
 | `TRIM <deg>`        | `OK TRIM <deg>`                                  | center offset, clamp +/-4, re-applies current angle |
 | `WD <ms>`           | `OK WD <ms>`                                     | watchdog timeout; `0` disables; default `1000`, capped at `60000` |
-| `GET`               | `STATE angle=.. trim=.. lim=../.. wd=.. up=..`   | full state; `up` = uptime ms |
-| `M <pct>`           | `OK M <applied_pct>`                             | drive duty, signed % clamped [-100,100]; + = forward, `0` = active-brake stop |
+| `DWD <ms>`          | `OK DWD <ms>`                                    | **drive** deadman; only `M` re-arms it. `0` = off (**default**), capped 60000 |
+| `GET`               | `STATE angle=.. trim=.. lim=../.. wd=.. dwd=.. drive=.. target=.. estop=.. up=..` | full state; `up` = uptime ms |
+| `M <pct>`           | `OK M <applied_pct>` / `ERR ESTOP latched, send ARM` | drive duty, signed % clamped [-100,100]; + = forward, `0` = active-brake stop |
+| `E`                 | `OK E estop latched`                             | latched e-stop: motor 0 + center, and `M` is refused until `ARM` |
+| `ARM`               | `OK ARM`                                         | clears the e-stop latch, re-arming at **zero** duty |
 | *(anything else)*   | `ERR unknown cmd`                                | |
+
+### The two independent failsafes (`WD` vs `DWD`)
+
+`WD` is the **link** watchdog: *any* accepted line re-arms it, so it catches "the
+Pi died / USB fell out" -> brake + re-center.
+
+`DWD` is the **drive** deadman: only an `M` re-arms it. It exists because the
+bridge deliberately feeds the firmware `PING` every 0.5 s during a manual window
+(`steering_node.py`), so `WD` alone cannot notice that the *operator* stopped
+asking for throttle -- a keepalive would hold the motor on. `DWD` cuts throttle
+(leaving steering) when no `M` has arrived in time.
+
+**`DWD` defaults to 0 (off) on purpose.** The autonomy path only refreshes `M`
+every 2 s, so a short deadman enabled by default would chop the motor mid-run.
+The RC/teleop client opts in (`DWD 400`) when it engages -- it streams `M` at
+20 Hz -- and clears it (`DWD 0`) on release.
+
+### Drive shaping (v2)
+
+Rising duty is slew-limited to ~0.5 %/ms (0->100 % in ~200 ms) so a snapped
+gamepad stick can't slam a 3S pack into a stalled motor. Falling duty and every
+stop path apply **immediately** -- a stop is never rate-limited. A direction
+reversal brakes to zero and dwells 120 ms before driving the other way, instead
+of flipping the bridge against the motor's back-EMF.
 
 Unsolicited lines the Pi may see at any time:
 

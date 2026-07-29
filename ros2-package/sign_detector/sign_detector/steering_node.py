@@ -39,7 +39,7 @@ CHANGE_DEG = 0.5
 
 MANUAL_WINDOW_S = 30.0
 MANUAL_DRIVE_DEADMAN_S = 5.0
-RAW_ALLOWED = ("PING", "GET", "C", "S", "U", "TRIM", "LIM", "M")
+RAW_ALLOWED = ("PING", "GET", "C", "S", "U", "TRIM", "LIM", "M", "DWD", "E", "ARM")
 
 
 class SteeringBridge(Node):
