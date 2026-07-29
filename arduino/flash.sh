@@ -28,7 +28,10 @@ pick_port() {
 
   case "$board" in
     uno)          pref='Arduino|ACM' ;;
-    nano|nano-old) pref='USB_Serial|CH340|1a86|wch' ;;
+    # The Nano in this robot is an FTDI FT232R, not a CH340 clone: it shows up
+    # as usb-FTDI_FT232R_USB_UART_<serial>-if00-port0, which none of the CH340
+    # patterns match. Without FTDI here it only worked via the blind fallback.
+    nano|nano-old) pref='FTDI|FT232|USB_Serial|CH340|1a86|wch' ;;
   esac
 
   if [ -d /dev/serial/by-id ]; then

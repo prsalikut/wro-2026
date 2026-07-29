@@ -15,7 +15,7 @@ wants to hold an angle must re-send it periodically.
 
 Port autodetect scans /dev/serial/by-id/* symlinks: it SKIPS the YDLIDAR X2
 (Silicon Labs CP210x, which must never be opened), prefers the Arduino Uno, then
-a CH340 Nano clone, else the first remaining entry.
+an FTDI/CH340 Nano, else the first remaining entry.
 """
 import glob
 import re
@@ -24,7 +24,13 @@ import time
 
 _EXCLUDE = re.compile(r"cp210|silicon", re.IGNORECASE)
 _PREFER = re.compile(r"arduino|2341", re.IGNORECASE)
-_SECOND = re.compile(r"ch340|1a86|usb_serial|wch", re.IGNORECASE)
+# The Nano actually in this robot is an FTDI FT232R (VID 0403), enumerating as
+# usb-FTDI_FT232R_USB_UART_<serial>-if00-port0. None of the CH340 patterns match
+# it ("usb_serial" does not match "USB_UART"), so before FTDI was listed here it
+# only ever worked by falling through to candidates[0] -- i.e. by luck, because
+# the lidar was the sole other device. A second USB-serial device sorting before
+# it would have silently opened the wrong port.
+_SECOND = re.compile(r"ftdi|ft232|0403|ch340|1a86|usb_serial|wch", re.IGNORECASE)
 
 
 def autodetect_port():
