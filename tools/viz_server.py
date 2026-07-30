@@ -1632,26 +1632,32 @@ RC_HTML = r"""<!doctype html>
    <h3>controls</h3>
    <div class="row"><label>max speed</label>
     <input id="max" type="range" min="0" max="70" value="55"
-     oninput="cfg.max=+this.value;document.getElementById('maxn').textContent=this.value+'%'">
+     oninput="setCfg('max',+this.value)">
     <span id="maxn">55%</span></div>
    <div class="row"><label>steer sens</label>
     <input id="sens" type="range" min="0.4" max="1" step="0.05" value="1"
-     oninput="cfg.sens=+this.value;document.getElementById('sensn').textContent=this.value">
+     oninput="setCfg('sens',+this.value)">
     <span id="sensn">1</span></div>
    <div class="row"><label>throttle</label>
-    <select id="thrmode" onchange="cfg.thr=this.value">
+    <select id="thrmode" onchange="setCfg('thr',this.value)">
      <option value="trig">triggers (RT/LT)</option>
      <option value="rstick">right stick Y</option></select>
     <label>steer axis</label>
-    <select id="saxis" onchange="cfg.steerAxis=+this.value">
+    <select id="saxis" onchange="setCfg('steerAxis',+this.value)">
      <option value="0">left stick X</option><option value="2">right stick X</option></select>
    </div>
    <div class="row"><label>deadman btn</label>
-    <select id="deadsel" onchange="cfg.dead=+this.value">
+    <select id="deadsel" onchange="setCfg('dead',+this.value)">
      <option value="5">RB (5)</option><option value="7">RT (7)</option>
      <option value="4">LB (4)</option><option value="0">A (0)</option></select>
-    <label><input type="checkbox" id="inv" onchange="cfg.invert=this.checked"> invert steer</label>
    </div>
+   <div class="row">
+    <label><input type="checkbox" id="inv" onchange="setCfg('invert',this.checked)"> invert steer</label>
+    <label><input type="checkbox" id="invthr" onchange="setCfg('invThr',this.checked)"> invert throttle</label>
+    <button onclick="resetCfg()">reset</button>
+   </div>
+   <div class="row dim" style="font-size:12px">input source:
+    <span id="src" class="num" style="font-size:12px">—</span></div>
   </div>
   <div class="card">
    <details><summary>gamepad tester (find your buttons/axes)</summary>
@@ -1662,33 +1668,88 @@ RC_HTML = r"""<!doctype html>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let cfg={thr:'trig',steerAxis:0,dead:5,invert:false,max:55,sens:1.0,expo:0.22};
+const CFG_DEFAULTS={thr:'trig',steerAxis:0,dead:5,invert:false,invThr:false,
+                    max:55,sens:1.0,expo:0.22};
+const CFG_KEY='wro_rc_cfg';
+let cfg=Object.assign({},CFG_DEFAULTS,(()=>{
+ try{return JSON.parse(localStorage.getItem(CFG_KEY))||{};}catch(e){return {};}})());
 let armed=false, estopped=false, gpIdx=null, key={}, last={steer:0,drive:0,deadman:false};
 function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;
  document.body.appendChild(d);setTimeout(()=>d.remove(),4000);}
 
+/* Every tuning change persists: an inverted-steer fix that resets on reload is
+   worse than no fix, since the driver re-discovers it at speed. */
+function setCfg(k,v){cfg[k]=v;
+ try{localStorage.setItem(CFG_KEY,JSON.stringify(cfg));}catch(e){}
+ applyCfg();
+ if(document.activeElement&&document.activeElement.blur)document.activeElement.blur();}
+function resetCfg(){cfg=Object.assign({},CFG_DEFAULTS);
+ try{localStorage.removeItem(CFG_KEY);}catch(e){}
+ applyCfg();toast('controls reset to defaults');}
+function applyCfg(){
+ $('max').value=cfg.max;      $('maxn').textContent=cfg.max+'%';
+ $('sens').value=cfg.sens;    $('sensn').textContent=cfg.sens;
+ $('thrmode').value=cfg.thr;  $('saxis').value=cfg.steerAxis;
+ $('deadsel').value=cfg.dead; $('inv').checked=!!cfg.invert;
+ $('invthr').checked=!!cfg.invThr;}
+
 // ---- gamepad ----
+/* The gamepadconnected event is unreliable on the Deck (it may never fire until
+   a button is pressed, and never re-fires after a tab reload), so rescan the
+   live list every frame instead of trusting a cached index from the event. */
 addEventListener('gamepadconnected',e=>{gpIdx=e.gamepad.index;setGp(e.gamepad.id);});
-addEventListener('gamepaddisconnected',e=>{if(gpIdx===e.gamepad.index)gpIdx=null;setGp(null);});
-function pad(){return gpIdx!=null?(navigator.getGamepads?navigator.getGamepads()[gpIdx]:null):null;}
+addEventListener('gamepaddisconnected',e=>{if(gpIdx===e.gamepad.index){gpIdx=null;setGp(null);}});
+function pad(){
+ const list=navigator.getGamepads?Array.from(navigator.getGamepads()):[];
+ if(gpIdx!=null&&list[gpIdx]&&list[gpIdx].connected)return list[gpIdx];
+ for(const g of list){if(g&&g.connected){
+  if(gpIdx!==g.index){gpIdx=g.index;setGp(g.id);}return g;}}
+ if(gpIdx!=null){gpIdx=null;setGp(null);}
+ return null;
+}
 function setGp(id){$('gp').textContent=id?String(id).slice(0,18):'none';
  $('gp').className=id?'ok':'dim';}
 function dz(x,d){return Math.abs(x)<(d||0.08)?0:x;}
 function expo(x,e){return (1-e)*x+e*x*x*x;}
 
-function readControls(){
- let steer=0,thr=0,dead=false,src='keyboard';
- const p=pad();
- if(p){src='pad';
-  steer=expo(dz(p.axes[cfg.steerAxis]||0),cfg.expo)*cfg.sens*(cfg.invert?-1:1);
-  if(cfg.thr==='trig'){const rt=(p.buttons[7]||{}).value||0,lt=(p.buttons[6]||{}).value||0;thr=rt-lt;}
-  else thr=-dz(p.axes[3]||0,0.12);
-  dead=!!((p.buttons[cfg.dead]||{}).pressed);
- } else {
-  steer=((key['arrowright']||key['d']?1:0)-(key['arrowleft']||key['a']?1:0))*cfg.sens*(cfg.invert?-1:1);
-  thr=(key['arrowup']||key['w']?1:0)-(key['arrowdown']||key['s']?1:0);
-  dead=!!(key['shift']||key['j']);
+/* Analog trigger, with an axis fallback for non-standard mappings that report
+   triggers on axes instead of buttons[6]/[7]. The fallback is gated on
+   mapping!=='standard' on purpose: under standard mapping those axis indices
+   are the right stick, which rests at 0 and would read as half throttle. */
+function trig(p,btn,axis){
+ const b=p.buttons[btn];
+ if(b){if(typeof b.value==='number'&&b.value>0.001)return b.value;
+       if(b.pressed)return 1;}
+ if(p.mapping!=='standard'){
+  const a=p.axes[axis];
+  if(typeof a==='number'&&a>-0.99)return (a+1)/2;   // rest -1 .. full +1
  }
+ return 0;
+}
+
+/* Read pad AND keyboard every frame and take whichever is further from centre.
+   Deck desktop mode can present a half-detected pad while simultaneously
+   emulating WASD, and the old pad-else-keyboard branch meant that combination
+   produced no input at all. */
+function readControls(){
+ const p=pad();
+ const kSteer=(key['arrowright']||key['d']?1:0)-(key['arrowleft']||key['a']?1:0);
+ const kThr=(key['arrowup']||key['w']?1:0)-(key['arrowdown']||key['s']?1:0);
+ const kDead=!!(key['shift']||key['j']);
+ let pSteer=0,pThr=0,pDead=false;
+ if(p){
+  pSteer=expo(dz(p.axes[cfg.steerAxis]||0),cfg.expo);
+  if(cfg.thr==='trig')pThr=trig(p,7,5)-trig(p,6,2);
+  else pThr=-dz(p.axes[3]||0,0.12);
+  pDead=!!((p.buttons[cfg.dead]||{}).pressed);
+ }
+ let steer=Math.abs(pSteer)>=Math.abs(kSteer)?pSteer:kSteer;
+ let thr=Math.abs(pThr)>=Math.abs(kThr)?pThr:kThr;
+ const dead=pDead||kDead;
+ const active=pSteer||pThr||pDead;
+ const src=p?(active?'pad':(kSteer||kThr||kDead?'keys (pad idle)':'pad idle')):'keys';
+ steer=steer*cfg.sens*(cfg.invert?-1:1);
+ thr=thr*(cfg.invThr?-1:1);
  return {steer:Math.max(-25,Math.min(25,steer*25)),
          drive:Math.max(-cfg.max,Math.min(cfg.max,thr*cfg.max)),
          deadman:dead, src};
@@ -1710,6 +1771,7 @@ setInterval(sendLoop,50);
 function frame(){
  last=readControls();
  $('padhint').style.display=pad()?'none':'';
+ $('src').textContent=last.src;
  const sPct=(last.steer/25)*50;              // -50..50 from centre
  const sf=$('steerfill');
  if(last.steer>=0){sf.style.left='50%';sf.style.width=sPct+'%';sf.style.background='#3a6ea5';}
@@ -1751,14 +1813,30 @@ async function estop(){estopped=true;armed=false;updateBtns();
 function updateBtns(){$('engage').style.display=armed?'none':'';
  $('disarm').style.display=armed?'':'none';}
 updateBtns();
+applyCfg();   // restore persisted invert/max/sens/axis before the first frame
 
 // ---- keyboard ----
+/* A focused slider/select swallows arrows and WASD, so a stray Deck click on
+   the tuning panel silently steals steering input. Blur it on the first key. */
+const DRIVE_KEYS=['arrowup','arrowdown','arrowleft','arrowright',
+                  'w','a','s','d',' '];
 addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+ const tag=e.target&&e.target.tagName;
+ if(DRIVE_KEYS.includes(k)&&(tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA')){
+  e.target.blur();e.preventDefault();}
  if(k===' '){e.preventDefault();estop();return;}
  if(k==='enter'){engage();return;}
  key[k]=true;
- if(['arrowup','arrowdown','arrowleft','arrowright'].includes(k))e.preventDefault();});
+ if(DRIVE_KEYS.includes(k))e.preventDefault();});
 addEventListener('keyup',e=>{key[e.key.toLowerCase()]=false;});
+
+/* Deck desktop mode emulates mouse/wheel/right-click from the pad; none of
+   those default browser gestures are wanted while driving. */
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('dblclick',e=>e.preventDefault());
+addEventListener('gesturestart',e=>e.preventDefault());
+addEventListener('wheel',e=>e.preventDefault(),{passive:false});
+addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
 
 // ---- safety: stop on tab hide / close ----
 addEventListener('beforeunload',()=>{try{navigator.sendBeacon('/api/rc/release');}catch(e){}});
