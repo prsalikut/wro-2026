@@ -77,11 +77,11 @@ cd arduino
 The Nano enumerates as an FTDI device. If `flash.sh` can't find it, list ports with
 `ls /dev/serial/by-id/` and pass the right one.
 
-### 4. Watch it work
+### 4. Check it works
 
-`tools/viz_server.py` serves a live view of the detections in a browser — run it on the Pi
-and open the printed URL from your laptop. `tools/smoke_test.py` is the quick "is anything
-publishing?" check, and `tools/auto_calib.py` re-derives the camera↔LiDAR angle offset.
+`tools/smoke_test.py` is the quick "is anything publishing?" check.
+`tools/auto_calib.py` re-derives the camera↔LiDAR angle offset.
+`tools/grab_frame.py` grabs a single camera frame for offline inspection.
 
 ### Tuning
 
