@@ -85,6 +85,9 @@ REPLIES = deque(maxlen=50)
 REPLY_SEQ = [0]
 MISSION = deque(maxlen=100)
 
+RC_STEER_LIMIT = 25.0
+RC_DRIVE_CEIL = 70.0
+RC = {"active": False, "max_pct": 55.0, "steer": 0.0, "drive": 0.0, "last": 0.0}
 
 
 def now():
@@ -357,9 +360,22 @@ class VizNode(Node):
         self.pub_steer = self.create_publisher(Float32, "steering_cmd", 10)
         self.pub_drive = self.create_publisher(Float32, "drive_cmd", 10)
         self.create_timer(1 / 15.0, self.render)
+        self.create_timer(0.05, self._rc_tick)
         self._pass_track = {}
 
+    def rc_publish(self, steer_deg, drive_pct):
+        ms = Float32(); ms.data = float(steer_deg); self.pub_steer.publish(ms)
+        md = Float32(); md.data = float(drive_pct); self.pub_drive.publish(md)
 
+    def _rc_tick(self):
+        """While RC is armed, republish the latest teleop command at a steady
+        20 Hz (the browser POST rate jitters). Zero the DRIVE if no browser
+        command has arrived for >0.5 s -- steering holds, but the motor must
+        not coast on a stale command. The bridge's 1 s failsafe backs this up."""
+        if not RC["active"]:
+            return
+        stale = now() - RC["last"] > 0.5
+        self.rc_publish(RC["steer"], 0.0 if stale else RC["drive"])
 
     def _img(self, m):
         self.img = self.br.imgmsg_to_cv2(m, "bgr8")
@@ -663,7 +679,9 @@ def act_estop():
     fallback: if the bridge/serial chain does not ACK the stop, stop the whole
     stack container -- the firmware watchdog then brakes+centers within ~1 s."""
     ABORT["epoch"] += 1
+    RC["active"] = False
     node = NODE["n"]
+    node.rc_publish(0.0, 0.0)
     r1 = node.send_raw("M 0", wait=1.5)
     r2 = node.send_raw("C", wait=1.5)
     autonomy_stop()
@@ -677,8 +695,60 @@ def act_estop():
             "acked": acked, "motor": r1, "servo": r2, "fallback": fallback}
 
 
+def rc_engage():
+    """Take manual control: stop the autonomous driver so it can't fight the
+    teleop topics, close any open manual window (so the bridge forwards our
+    steering_cmd/drive_cmd), and ARM the 20 Hz republish tick. The robot stays
+    still (drive 0) until the operator holds the deadman AND pushes throttle."""
+    autonomy_stop()
+    node = NODE["n"]
+    node.send_raw("RESUME", wait=1.0)
+    with LOCK:
+        RC["active"] = True
+        RC["steer"] = 0.0
+        RC["drive"] = 0.0
+        RC["last"] = now()
+    node.rc_publish(0.0, 0.0)
+    log_event("rc", "RC ENGAGED (autonomy stopped, manual control armed)")
+    return {"ok": True, "max_pct": RC["max_pct"]}
 
 
+def rc_command(steer, drive, deadman, max_pct=None):
+    """One teleop sample from the browser. Clamps hard; DRIVE is forced to 0
+    unless the deadman is held. Does not arm RC (only rc_engage does, so an
+    E-STOP stays latched); the 20 Hz _rc_tick republishes RC[] so the browser's
+    jittery POST rate cannot open gaps in the command stream."""
+    try:
+        steer = float(steer); drive = float(drive)
+    except (TypeError, ValueError):
+        return {"ok": False, "err": "bad steer/drive"}
+    if not (math.isfinite(steer) and math.isfinite(drive)):
+        return {"ok": False, "err": "non-finite"}
+    with LOCK:
+        if max_pct is not None:
+            try:
+                RC["max_pct"] = max(0.0, min(RC_DRIVE_CEIL, float(max_pct)))
+            except (TypeError, ValueError):
+                pass
+        cap = RC["max_pct"]
+        RC["steer"] = max(-RC_STEER_LIMIT, min(RC_STEER_LIMIT, steer))
+        RC["drive"] = max(-cap, min(cap, drive)) if deadman else 0.0
+        RC["last"] = now()
+        armed, out_s, out_d = RC["active"], RC["steer"], RC["drive"]
+    return {"ok": True, "active": armed, "steer": out_s, "drive": out_d,
+            "max_pct": cap, "armed": bool(deadman)}
+
+
+def rc_release():
+    """Operator let go / closed the tab: stop the motor now and disarm."""
+    node = NODE["n"]
+    with LOCK:
+        RC["active"] = False
+        RC["steer"] = 0.0
+        RC["drive"] = 0.0
+    node.rc_publish(0.0, 0.0)
+    log_event("rc", "RC released (motor stop, disarmed)")
+    return {"ok": True}
 
 
 def preflight():
@@ -911,6 +981,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/estop":
             self._json(act_estop()); return
+        if p == "/api/rc/engage":
+            self._json(rc_engage()); return
+        if p == "/api/rc/release":
+            self._json(rc_release()); return
+        if p == "/api/rc":
+            self._json(rc_command(body.get("steer", 0.0), body.get("drive", 0.0),
+                                  bool(body.get("deadman", False)),
+                                  body.get("max_pct"))); return
         if p == "/api/mode":
             m = str(body.get("mode", ""))
             if m not in MODES:
@@ -951,6 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
                     slow = max(0.5, min(1.0, slow))
             except (TypeError, ValueError):
                 self._json({"ok": False, "err": "bad cruise/slow"}, 400); return
+            RC["active"] = False
             NODE["n"].send_raw("RESUME", wait=1.0)
             ok = autonomy_start(cruise, slow)
             time.sleep(1.5)
@@ -1136,7 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        body = PANEL_HTML.encode()
+        body = (RC_HTML if self.path.startswith("/rc") else PANEL_HTML).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1205,6 +1284,7 @@ PANEL_HTML = r"""<!doctype html>
  <div class="tab" data-m="desktop" onclick="setMode('desktop')">🖥️ desktop</div>
  <div class="tab" data-m="assembly" onclick="setMode('assembly')">🔧 assembly</div>
  <div class="tab" data-m="final" onclick="setMode('final')">🏁 final</div>
+ <a class="tab" href="/rc" target="_blank" style="text-decoration:none">🎮 RC drive</a>
  <span class="chip">stack <span id="c_stack" class="dim">?</span></span>
  <span class="chip">auto <span id="c_auto" class="dim">?</span></span>
  <span class="chip">cam <span id="c_cam" class="dim">?</span></span>
@@ -1424,6 +1504,282 @@ async function poll(){
  }catch(e){}
 }
 setInterval(poll,2000);poll();
+</script></body></html>
+"""
+
+
+RC_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WRO RC drive</title>
+<style>
+ :root{--bg:#0e0e10;--card:#17191e;--line:#262a32;--txt:#e6e9ef;--dim:#8b93a1;
+       --ok:#43d364;--bad:#ff6b6b;--warn:#ffb64d;--acc:#5aa2ff}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--txt);
+      font-family:system-ui,sans-serif;font-size:14px;overflow-x:hidden}
+ header{display:flex;gap:8px;align-items:center;padding:8px 14px;
+        border-bottom:1px solid var(--line);flex-wrap:wrap}
+ header b{font-size:16px}
+ a.back{color:var(--dim);text-decoration:none;border:1px solid var(--line);
+        padding:5px 10px;border-radius:7px}
+ .pill{padding:4px 10px;border-radius:11px;font-size:12px;background:#1c2027;
+       border:1px solid var(--line)}
+ #engage{background:#123020;border:1px solid #2c6f47;color:#8ff0b6;
+         font-weight:700;padding:8px 16px;border-radius:8px;cursor:pointer}
+ #disarm{background:#1c2027;border:1px solid var(--line);color:var(--dim);
+         padding:8px 14px;border-radius:8px;cursor:pointer}
+ #estop{margin-left:auto;background:#3a1414;border:1px solid #7c2626;
+        color:#ff9c9c;font-weight:800;padding:10px 22px;border-radius:8px;
+        cursor:pointer;font-size:15px}
+ #estop:hover{background:#521b1b}
+ .wrap{display:grid;grid-template-columns:minmax(320px,1.4fr) minmax(280px,1fr);
+       gap:12px;padding:12px;max-width:1250px;margin:0 auto}
+ @media(max-width:820px){.wrap{grid-template-columns:1fr}}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+ .card h3{margin:0 0 8px;font-size:12px;letter-spacing:.6px;color:var(--dim);
+          text-transform:uppercase}
+ #camwrap{position:relative}
+ img#cam{width:100%;border-radius:8px;background:#000;display:block;aspect-ratio:4/3;object-fit:cover}
+ #hud{position:absolute;left:0;right:0;bottom:0;top:0;pointer-events:none}
+ .banner{position:absolute;top:10px;left:50%;transform:translateX(-50%);
+         padding:6px 14px;border-radius:8px;font-weight:700;font-size:13px}
+ .b_safe{background:rgba(30,34,42,.85);color:#9aa3b2;border:1px solid #333}
+ .b_armed{background:rgba(18,60,32,.85);color:#8ff0b6;border:1px solid #2c6f47}
+ .b_estop{background:rgba(80,20,20,.9);color:#ffb4b4;border:1px solid #7c2626}
+ .gauges{display:flex;gap:14px;align-items:flex-end;margin-top:10px}
+ .steerbar{position:relative;flex:1;height:26px;background:#101216;border:1px solid var(--line);
+           border-radius:6px;overflow:hidden}
+ .steerfill{position:absolute;top:0;bottom:0;background:#2b3d5c}
+ .steermid{position:absolute;left:50%;top:0;bottom:0;width:2px;background:#4a5265}
+ .thr{position:relative;width:54px;height:120px;background:#101216;border:1px solid var(--line);
+      border-radius:6px;overflow:hidden}
+ .thrfill{position:absolute;left:0;right:0}
+ .thrmid{position:absolute;left:0;right:0;top:50%;height:2px;background:#4a5265}
+ .lamp{display:inline-block;width:11px;height:11px;border-radius:50%;background:#3a3f49;
+       vertical-align:middle;margin-right:5px}
+ .lamp.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+ .num{font-family:ui-monospace,monospace;font-size:22px;font-weight:700}
+ .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:7px 0}
+ label{color:var(--dim)}
+ select,input[type=number]{background:#12141a;color:var(--txt);border:1px solid var(--line);
+        border-radius:6px;padding:5px 7px;font-size:13px}
+ input[type=range]{width:160px}
+ .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+ kbd{background:#101216;border:1px solid var(--line);border-bottom-width:2px;
+     border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:12px}
+ #raw{font-family:ui-monospace,monospace;font-size:11px;color:var(--dim);
+      background:#101216;border:1px solid var(--line);border-radius:6px;padding:7px;
+      white-space:pre-wrap;max-height:120px;overflow:auto}
+ details summary{cursor:pointer;color:var(--dim);margin:4px 0}
+ .toast{position:fixed;bottom:16px;right:16px;background:#1c2333;border:1px solid var(--acc);
+        padding:10px 16px;border-radius:8px;max-width:420px;z-index:9}
+</style></head><body>
+<header>
+ <b>🎮 RC drive</b>
+ <a class="back" href="/">← console</a>
+ <span class="pill">pad <span id="gp" class="dim">scanning…</span></span>
+ <span class="pill">link <span id="link" class="dim">?</span></span>
+ <button id="gpscan" onclick="scanGamepads();setTimeout(()=>{$('gp').textContent=pad()?'connected':'none — press controller button';$('gp').className=pad()?'ok':'dim';},300);" style="background:#1c2030;border:1px solid var(--line);color:var(--dim);padding:5px 9px;border-radius:6px;cursor:pointer;font-size:12px">↻ scan</button>
+ <button id="engage" onclick="engage()">▶ ENGAGE</button>
+ <button id="disarm" onclick="disarm()">■ disarm</button>
+ <button id="estop" onclick="estop()">■ E-STOP</button>
+</header>
+<div class="wrap">
+ <div class="card" id="camwrap">
+  <img id="cam" alt="FPV">
+  <div id="hud">
+   <div id="banner" class="banner b_safe">NOT ENGAGED — press ENGAGE</div>
+  </div>
+  <div class="gauges">
+   <div style="flex:1">
+    <div class="dim" style="font-size:12px">steering <span id="steern" class="num" style="font-size:15px">0°</span></div>
+    <div class="steerbar"><div class="steermid"></div><div id="steerfill" class="steerfill"></div></div>
+   </div>
+   <div style="text-align:center">
+    <div class="dim" style="font-size:12px">throttle</div>
+    <div class="thr"><div class="thrmid"></div><div id="thrfill" class="thrfill"></div></div>
+    <div id="driven" class="num" style="font-size:15px">0%</div>
+   </div>
+  </div>
+  <div class="row"><span><span id="deadlamp" class="lamp"></span><span id="deadtxt" class="dim">deadman: release</span></span></div>
+ </div>
+
+ <div>
+  <div class="card">
+   <h3>how to drive</h3>
+   <div class="dim" style="line-height:1.7">
+    0. Click <b>"↻ scan"</b> then press any controller button to connect.<br>
+    1. Press <b>ENGAGE</b> (enter key) — stops autonomy, takes direct control.<br>
+    2. <b>Hold the deadman</b> (gamepad <b>RB</b> / keyboard <kbd>Shift</kbd>) — motor only runs while held.<br>
+    3. Steer: <b>left stick</b> / <kbd>A</kbd><kbd>D</kbd> &nbsp; Throttle: <b>RT</b>/<b>LT</b> triggers / <kbd>W</kbd><kbd>S</kbd>.<br>
+    <kbd>Esc</kbd> = disarm &nbsp; <kbd>Space</kbd> = E-STOP.<br>
+    <span style="color:#ffb64d">Steam Deck:</span> run <code>flatpak override --user --device=all org.mozilla.firefox</code> once.
+   </div>
+  </div>
+  <div class="card">
+   <h3>controls</h3>
+   <div class="row"><label>max speed</label>
+    <input id="max" type="range" min="0" max="70" value="55"
+     oninput="cfg.max=+this.value;document.getElementById('maxn').textContent=this.value+'%'">
+    <span id="maxn">55%</span></div>
+   <div class="row"><label>steer sens</label>
+    <input id="sens" type="range" min="0.4" max="1" step="0.05" value="1"
+     oninput="cfg.sens=+this.value;document.getElementById('sensn').textContent=this.value">
+    <span id="sensn">1</span></div>
+   <div class="row"><label>throttle</label>
+    <select id="thrmode" onchange="cfg.thr=this.value">
+     <option value="trig">triggers (RT/LT)</option>
+     <option value="rstick">right stick Y</option></select>
+    <label>steer axis</label>
+    <select id="saxis" onchange="cfg.steerAxis=+this.value">
+     <option value="0">left stick X</option><option value="2">right stick X</option></select>
+   </div>
+   <div class="row"><label>deadman btn</label>
+    <select id="deadsel" onchange="cfg.dead=+this.value">
+     <option value="5">RB (5)</option><option value="7">RT (7)</option>
+     <option value="4">LB (4)</option><option value="0">A (0)</option></select>
+    <label><input type="checkbox" id="inv" onchange="cfg.invert=this.checked"> invert steer</label>
+   </div>
+  </div>
+  <div class="card">
+   <details><summary>gamepad tester (find your buttons/axes)</summary>
+    <div id="raw">connect a controller and press buttons…</div>
+   </details>
+  </div>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let cfg={thr:'trig',steerAxis:0,dead:5,invert:false,max:55,sens:1.0,expo:0.22};
+let armed=false, estopped=false, gpIdx=null, key={}, last={steer:0,drive:0,deadman:false};
+let gpPollId=null, gpEver=false;
+function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;
+ document.body.appendChild(d);setTimeout(()=>d.remove(),4000);}
+
+// ---- gamepad (Steam Deck / Firefox proof) ----
+addEventListener('gamepadconnected',e=>{gpIdx=e.gamepad.index;gpEver=true;setGp(e.gamepad.id);});
+addEventListener('gamepaddisconnected',e=>{if(gpIdx===e.gamepad.index){gpIdx=null;gpEver=false;}setGp(null);});
+function scanGamepads(){const gps=navigator.getGamepads?navigator.getGamepads():null;if(!gps)return;
+ for(let i=0;i<gps.length;i++){if(gps[i]&&gps[i].connected){if(gpIdx!==i){gpIdx=i;gpEver=true;setGp(gps[i].id);}return;}}
+ gpIdx=null;}
+if(!gpPollId)gpPollId=setInterval(scanGamepads,1000);
+function pad(){const gps=navigator.getGamepads?navigator.getGamepads():null;
+ return(gpIdx!=null&&gps&&gps[gpIdx]&&gps[gpIdx].connected)?gps[gpIdx]:null;}
+function setGp(id){$('gp').textContent=id?String(id).slice(0,26):'none';
+ $('gp').className=id?'ok':'dim';}
+function dz(x,d){return Math.abs(x)<(d||0.08)?0:x;}
+function expo(x,e){return (1-e)*x+e*x*x*x;}
+
+function readTriggers(p){var rt=0,lt=0;
+ if(p.buttons){rt=(p.buttons[7]||{}).value||0;lt=(p.buttons[6]||{}).value||0;}
+ if(rt===0&&lt===0&&p.axes&&p.axes.length>5){rt=p.axes[5]!==void 0?(p.axes[5]+1)/2:0;lt=p.axes[4]!==void 0?(p.axes[4]+1)/2:0;}
+ return{rt:Math.max(0,Math.min(1,rt)),lt:Math.max(0,Math.min(1,lt))};}
+
+function readControls(){
+ let steer=0,thr=0,dead=false,src='keyboard';
+ const p=pad();
+ if(p){src='pad';
+  steer=expo(dz(p.axes[cfg.steerAxis]||0),cfg.expo)*cfg.sens*(cfg.invert?-1:1);
+  if(cfg.thr==='trig'){var t=readTriggers(p);thr=t.rt-t.lt;}
+  else thr=-dz(p.axes[3]||0,0.12);
+  dead=!!((p.buttons[cfg.dead]||{}).pressed);
+ } else {
+  steer=((key['arrowright']||key['d']?1:0)-(key['arrowleft']||key['a']?1:0))*cfg.sens*(cfg.invert?-1:1);
+  thr=(key['arrowup']||key['w']?1:0)-(key['arrowdown']||key['s']?1:0);
+  dead=!!(key['shift']||key['j']);
+ }
+ return {steer:Math.max(-25,Math.min(25,steer*25)),
+         drive:Math.max(-cfg.max,Math.min(cfg.max,thr*cfg.max)),
+         deadman:dead, src};
+}
+
+// ---- 20 Hz send ----
+async function sendLoop(){
+ if(!armed||estopped)return;
+ const c=last;
+ try{
+  const r=await fetch('/api/rc',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({steer:c.steer,drive:c.deadman?c.drive:0,deadman:c.deadman,max_pct:cfg.max})});
+  await r.json();
+ }catch(e){/* transient */}
+}
+setInterval(sendLoop,50);
+
+// ---- 60 Hz render ----
+function frame(){
+ last=readControls();
+ const sPct=(last.steer/25)*50;              // -50..50 from centre
+ const sf=$('steerfill');
+ if(last.steer>=0){sf.style.left='50%';sf.style.width=sPct+'%';sf.style.background='#3a6ea5';}
+ else{sf.style.left=(50+sPct)+'%';sf.style.width=(-sPct)+'%';sf.style.background='#a5713a';}
+ $('steern').textContent=last.steer.toFixed(0)+'°';
+ const dv=last.deadman?last.drive:0, dPct=(dv/70)*50;
+ const tf=$('thrfill');
+ if(dv>=0){tf.style.bottom='50%';tf.style.top='auto';tf.style.height=dPct+'%';tf.style.background='#43d364';}
+ else{tf.style.top='50%';tf.style.bottom='auto';tf.style.height=(-dPct)+'%';tf.style.background='#ffb64d';}
+ $('driven').textContent=dv.toFixed(0)+'%';
+ const held=last.deadman;
+ $('deadlamp').className='lamp'+(held?' on':'');
+ $('deadtxt').textContent=held?'deadman: HELD (drive live)':'deadman: release';
+ $('deadtxt').className=held?'ok':'dim';
+ setBanner();
+ drawRaw();
+ requestAnimationFrame(frame);
+}
+function setBanner(){
+ const b=$('banner');
+ if(estopped){b.className='banner b_estop';b.textContent='E-STOPPED — press ENGAGE to re-arm';}
+ else if(!armed){b.className='banner b_safe';b.textContent='NOT ENGAGED — press ENGAGE';}
+ else if(last.deadman){b.className='banner b_armed';b.textContent='DRIVING — deadman held';}
+ else{b.className='banner b_safe';b.textContent='ARMED — hold deadman to drive';}
+}
+function drawRaw(){const p=pad();if(!p){$('raw').textContent='no gamepad detected — press any button on your controller…';return;}
+ const ax=Array.from(p.axes).map((a,i)=>i+':'+a.toFixed(2)).join(' ');
+ const bt=[];for(let i=0;i<(p.buttons||[]).length;i++){const b=p.buttons[i];if(b.pressed||b.value>0.1)bt.push(i+(b.value>0.1?':'+b.value.toFixed(2):''));}
+ var t=readTriggers(p);
+ $('raw').textContent='axes '+ax+'\nbtns ['+bt.join(' ')+']\nRT='+t.rt.toFixed(2)+' LT='+t.lt.toFixed(2);}
+requestAnimationFrame(frame);
+
+// ---- engage / disarm / estop ----
+async function engage(){try{const j=await(await fetch('/api/rc/engage',{method:'POST'})).json();
+ armed=true;estopped=false;toast('RC engaged — autonomy stopped');}catch(e){toast('✗ engage failed');}updateBtns();}
+async function disarm(){armed=false;updateBtns();try{await fetch('/api/rc/release',{method:'POST'});}catch(e){}}
+async function estop(){estopped=true;armed=false;updateBtns();
+ try{const j=await(await fetch('/api/estop',{method:'POST'})).json();
+  toast(j.acked?'E-STOP acknowledged':(j.fallback||'E-STOP sent'));}catch(e){toast('✗ E-STOP — cut power!');}}
+function updateBtns(){$('engage').style.display=armed?'none':'';
+ $('disarm').style.display=armed?'':'none';}
+updateBtns();
+
+// ---- keyboard ----
+addEventListener('keydown',e=>{var k=e.key.toLowerCase();
+ if(k===' '){e.preventDefault();estop();return;}
+ if(k==='enter'){e.preventDefault();if(!armed)engage();return;}
+ if(k==='escape'){e.preventDefault();if(armed)disarm();return;}
+ key[k]=true;
+ if(['arrowup','arrowdown','arrowleft','arrowright'].includes(k))e.preventDefault();});
+addEventListener('keyup',e=>{key[e.key.toLowerCase()]=false;});
+
+// ---- safety: stop on tab hide / close ----
+addEventListener('beforeunload',()=>{try{navigator.sendBeacon('/api/rc/release');}catch(e){}});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&armed){
+ armed=false;updateBtns();try{navigator.sendBeacon('/api/rc/release');}catch(e){}}});
+addEventListener('blur',()=>{key={};});   // drop stuck keys when focus leaves
+
+// ---- FPV camera (snapshot polling; browser-safe) ----
+(function(){const im=$('cam');let n=0;
+ function tick(){im.src='/snapshot?t='+(n++);}
+ im.onload=()=>setTimeout(tick,110);im.onerror=()=>setTimeout(tick,900);tick();})();
+
+// ---- link/bridge health ----
+async function health(){try{const s=await(await fetch('/api/status')).json();
+ const b=s.bridge;const el=$('link');
+ if(b&&b.connected){el.textContent=b.manual?'manual':'ok';el.className='ok';}
+ else{el.textContent='down';el.className='bad';}
+ if(s.stack===false){el.textContent='stack off';el.className='bad';}
+ }catch(e){$('link').textContent='?';$('link').className='dim';}}
+setInterval(health,1500);health();
 </script></body></html>
 """
 
