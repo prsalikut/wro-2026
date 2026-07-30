@@ -77,7 +77,19 @@ cd arduino
 The Nano enumerates as an FTDI device. If `flash.sh` can't find it, list ports with
 `ls /dev/serial/by-id/` and pass the right one.
 
-### 4. Check it works
+### 4. Start the web dashboard (test console)
+
+```bash
+mkdir -p ~/sign_detector/tools
+cp ~/sign_detector-repo/tools/viz_server.py ~/sign_detector/tools/
+
+docker exec -d signstack bash -lc \
+  'source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && python3 /ros2_ws/src/sign_detector/tools/viz_server.py'
+```
+
+Open **http://\<pi\>:8080** — three modes: desktop, assembly, final.
+
+### 5. Check it works
 
 `tools/smoke_test.py` is the quick "is anything publishing?" check.
 `tools/auto_calib.py` re-derives the camera↔LiDAR angle offset.
