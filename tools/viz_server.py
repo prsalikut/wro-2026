@@ -1516,6 +1516,11 @@ RC_HTML = r"""<!doctype html>
  :root{--bg:#0e0e10;--card:#17191e;--line:#262a32;--txt:#e6e9ef;--dim:#8b93a1;
        --ok:#43d364;--bad:#ff6b6b;--warn:#ffb64d;--acc:#5aa2ff}
  *{box-sizing:border-box}
+ /* Steam Deck desktop mode drives the browser with emulated mouse/wheel/keys.
+    Lock out every default gesture so a stick nudge cannot scroll, zoom,
+    text-select or right-click the page out from under the driver. */
+ html,body{overscroll-behavior:none;touch-action:none;
+      -webkit-user-select:none;user-select:none}
  body{margin:0;background:var(--bg);color:var(--txt);
       font-family:system-ui,sans-serif;font-size:14px;overflow-x:hidden}
  header{display:flex;gap:8px;align-items:center;padding:8px 14px;
@@ -1613,6 +1618,15 @@ RC_HTML = r"""<!doctype html>
     3. Steer: <b>left stick</b> / <kbd>A</kbd><kbd>D</kbd> &nbsp; Throttle: <b>RT</b>/<b>LT</b> triggers / <kbd>W</kbd><kbd>S</kbd>.<br>
     <kbd>Space</kbd> = E-STOP. Release deadman or the tab and the motor stops.
    </div>
+   <div id="padhint" class="row" style="display:none;line-height:1.6">
+    <span class="warn">No gamepad visible to the browser.</span>
+    <span class="dim">On Steam Deck <b>desktop mode</b> the pad defaults to
+    emulating mouse+keyboard, so the browser sees no controller. Either add the
+    browser to Steam as a non-Steam game and launch it with the
+    <b>Gamepad</b> controller layout, or just drive with the emulated
+    keys — <kbd>A</kbd><kbd>D</kbd>/<kbd>W</kbd><kbd>S</kbd>/<kbd>Shift</kbd>
+    work as a fallback. Press any button to wake pad detection.</span>
+   </div>
   </div>
   <div class="card">
    <h3>controls</h3>
@@ -1695,6 +1709,7 @@ setInterval(sendLoop,50);
 // ---- 60 Hz render ----
 function frame(){
  last=readControls();
+ $('padhint').style.display=pad()?'none':'';
  const sPct=(last.steer/25)*50;              // -50..50 from centre
  const sf=$('steerfill');
  if(last.steer>=0){sf.style.left='50%';sf.style.width=sPct+'%';sf.style.background='#3a6ea5';}
