@@ -27,6 +27,44 @@ Pi OS / Debian 13), with a **USB webcam** + **YDLIDAR X2**.
   high **saturation** floor to separate red from the floor/wood. Switch `PROFILE`/`profile` to
   `"official"` and recalibrate at the venue.
 
+## Wiring
+
+Arduino Uno or Nano (both ATmega328P) — the same sketch runs on either. Pin defines live
+at the top of `arduino/steering_firmware/steering_firmware.ino`; `arduino/README.md` has the
+full detail including the serial protocol and calibration.
+
+| Pin | Signal | Goes to |
+|---|---|---|
+| **D2** | Servo signal | MG995 signal (orange) |
+| **D5** | RPWM (forward) | BTS7960 RPWM — Timer0 OC0B |
+| **D6** | LPWM (reverse) | BTS7960 LPWM — Timer0 OC0A |
+| **D7** | R_EN | BTS7960 R_EN (digital kill switch) |
+| **D8** | L_EN | BTS7960 L_EN (digital kill switch) |
+| 5V | Logic power | BTS7960 VCC |
+| GND | Common ground bus | servo PSU (−), BTS7960, 3S (−) |
+| USB | Power + serial | Raspberry Pi |
+
+Motor power: `3S (+) → fuse → switch → B+`, and `3S (−) → B− + common ground`.
+
+Two constraints that will bite you:
+
+- **Never put motor PWM on D9/D10.** `Servo.h` claims Timer1, which kills `analogWrite` on
+  those pins. D5/D6 are Timer0, which coexists with both the servo and `millis()`.
+- **Servo power must be external** — a dedicated 5–6 V supply to MG995 V+ (red) and its
+  ground (brown), *never* the Arduino 5V pin. An MG995 stalls at a couple of amps and will
+  brown out the onboard regulator, resetting the board mid-run. The external supply's ground
+  **must** be tied to Arduino GND; the Arduino only emits the control pulse on D2.
+
+Behavior worth knowing before you drive:
+
+- R_EN/L_EN are raised HIGH once at boot and **stay** high — per-command toggling stopped
+  this board from driving. `M 0`, the watchdog, and boot all set both PWM inputs low with the
+  bridge enabled = **active brake**.
+- The Johnson 500 needs roughly **≥40–50% duty to start** (validated bench value ~59%,
+  150/255). Lower duties ACK but do not move the motor.
+- Sign convention: **`+deg` = steer RIGHT, `−deg` = LEFT.** Steering calibrated 2026-07-11 to
+  `DEG2US = 24.0`, so `S ±25` maps to `1500 ± 600 µs`, hard-clamped to `[850, 2150]`.
+
 ## Setup — start here
 
 ### What you need
