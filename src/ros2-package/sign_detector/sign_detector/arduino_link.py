@@ -17,6 +17,7 @@ Port autodetect scans /dev/serial/by-id/* symlinks: it SKIPS the YDLIDAR X2
 (Silicon Labs CP210x, which must never be opened), prefers the Arduino Uno, then
 an FTDI/CH340 Nano, else the first remaining entry.
 """
+import collections
 import glob
 import re
 import threading
@@ -67,6 +68,10 @@ class ArduinoLink:
         self._lock = threading.Lock()
         self.banner = None
         self.pong = None
+        # USON makes the Nano emit "US ..." lines unprompted. They share the port
+        # with command/reply traffic, so they are parked here rather than being
+        # mistaken for a reply (or discarded); poll_stream() hands them over.
+        self._stream = collections.deque(maxlen=200)
 
     @staticmethod
     def _import_serial():
@@ -122,16 +127,65 @@ class ArduinoLink:
                 self.banner = line
                 break
 
+    @staticmethod
+    def _is_stream(line):
+        """True for an unprompted sonar broadcast (USON), not a command reply."""
+        return line.startswith("US ")
+
+    def _readline(self):
+        return self._ser.readline().decode("ascii", "replace").strip()
+
+    def _soak_pending(self):
+        """Park already-buffered stream lines instead of dropping them.
+
+        This replaces a reset_input_buffer() that discarded whatever had arrived
+        since the last command -- with USON running that is the entire sonar
+        feed, which is why streaming appeared to be stuck at a trickle. Stale
+        non-stream lines are still dropped, since resyncing is the point."""
+        try:
+            while self._ser.in_waiting:
+                line = self._readline()
+                if not line:
+                    break
+                if self._is_stream(line):
+                    self._stream.append(line)
+        except Exception:
+            pass
+
+    def poll_stream(self):
+        """Pop the sensor lines that arrived unprompted since the last call."""
+        with self._lock:
+            if self._ser is not None:
+                self._soak_pending()
+            out = list(self._stream)
+            self._stream.clear()
+            return out
+
     def _write_read(self, cmd):
         """Write one command line and return the stripped reply line. Raises on any
            serial error or if the link is not open."""
         if self._ser is None:
             raise RuntimeError("ArduinoLink not connected; call connect() first")
-        line = (cmd.strip() + "\n").encode("ascii")
-        self._ser.reset_input_buffer()
-        self._ser.write(line)
+        cmd = cmd.strip()
+        verb = cmd.split()[0].upper() if cmd else ""
+        self._soak_pending()
+        self._ser.write((cmd + "\n").encode("ascii"))
         self._ser.flush()
-        return self._ser.readline().decode("ascii", "replace").strip()
+        # A one-shot US reply is byte-identical to a USON broadcast, so only the
+        # US verb may claim one; for every other verb a US line is stream noise
+        # to be stepped over until the real reply shows up.
+        claims_us = verb == "US"
+        deadline = time.time() + max(self.timeout, 0.2) * 4.0
+        while True:
+            line = self._readline()
+            if not line:
+                return ""
+            if self._is_stream(line) and not claims_us:
+                self._stream.append(line)
+                if time.time() >= deadline:
+                    return ""
+                continue
+            return line
 
     def send(self, cmd):
         """Thread-safe command/reply. On a serial error, drop the handle, try ONE

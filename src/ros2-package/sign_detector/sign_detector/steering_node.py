@@ -39,7 +39,11 @@ CHANGE_DEG = 0.5
 
 MANUAL_WINDOW_S = 30.0
 MANUAL_DRIVE_DEADMAN_S = 5.0
-RAW_ALLOWED = ("PING", "GET", "C", "S", "U", "TRIM", "LIM", "M", "DWD", "E", "ARM")
+RAW_ALLOWED = ("PING", "GET", "C", "S", "U", "TRIM", "LIM", "M", "WD", "DWD",
+               "ARM", "E", "US", "USON", "USOFF")
+# Verbs that only inspect / keepalive and must NOT open a manual window
+# (opening manual suspends /drive_cmd forwarding and kills RC throttle).
+RAW_NO_MANUAL = ("PING", "GET", "US", "USON", "USOFF")
 
 
 class SteeringBridge(Node):
@@ -53,7 +57,7 @@ class SteeringBridge(Node):
             ("max_deg", 25.0),
             ("rate_limit_dps", 0.0),
             ("cmd_timeout_s", 1.0),
-            ("drive_max_pct", 40.0),
+            ("drive_max_pct", 70.0),
             ("center_on_shutdown", True),
         ])
         g = self.get_parameter
@@ -159,15 +163,18 @@ class SteeringBridge(Node):
                 self._manual_m_live = v != 0.0
             except ValueError:
                 pass
-        self.manual_until = now + MANUAL_WINDOW_S
-        self._last_raw_time = now
-        if not self._manual_active:
-            self._manual_active = True
-            try:
-                self.link.send("M 0")
-            except Exception:
-                pass
-            self.get_logger().info("manual window OPEN (drive stopped, autonomy suspended)")
+        open_manual = verb not in RAW_NO_MANUAL
+        if open_manual:
+            self.manual_until = now + MANUAL_WINDOW_S
+            self._last_raw_time = now
+            if not self._manual_active:
+                self._manual_active = True
+                try:
+                    self.link.send("M 0")
+                except Exception:
+                    pass
+                self.get_logger().info(
+                    "manual window OPEN (drive stopped, autonomy suspended)")
         cmd = " ".join(parts)
         try:
             reply = self.link.send(cmd)
@@ -176,6 +183,14 @@ class SteeringBridge(Node):
         except Exception as exc:
             reply = "ERR link: {}".format(exc)
         self._reply("{} -> {}".format(cmd, reply))
+
+    def _pump_stream(self):
+        try:
+            lines = self.link.poll_stream()
+        except Exception:
+            return
+        for line in lines:
+            self._reply(line)
 
     def _reply(self, text):
         m = String()
@@ -215,6 +230,11 @@ class SteeringBridge(Node):
         now = self._now()
         dt = now - self._last_tick
         self._last_tick = now
+
+        # Unprompted sonar broadcasts share the port with command traffic. Drain
+        # them every tick, before the manual-mode early return, so the feed keeps
+        # flowing while a manual window is open.
+        self._pump_stream()
 
         if now < self.manual_until:
             if (self._manual_m_live
@@ -270,7 +290,10 @@ class SteeringBridge(Node):
                 "drive_cmd stale for {:.1f}s -> motor stop".format(self.cmd_timeout))
         d_changed = (self.last_drive_sent is None
                      or abs(self.drive_cmd - self.last_drive_sent) > 1.0)
-        d_refresh = (now - self.last_drive_send_time) >= 2.0
+        # Refresh often while moving so firmware WD/DWD and USB glitches cannot
+        # drop throttle. Idle (0) only needs a slow keepalive.
+        refresh_s = 0.15 if abs(self.drive_cmd) > 0.5 else 2.0
+        d_refresh = (now - self.last_drive_send_time) >= refresh_s
         if d_changed or d_refresh:
             self._send_drive(self.drive_cmd)
 
