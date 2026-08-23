@@ -24,6 +24,21 @@ the drive watchdog and serial parser never block.
 
 ## 3. Push to the Pi
 
+From a machine that can reach the Pi (not a cloud session), one command does the
+whole cycle -- copy, rebuild, restart, then check every sensor:
+
+    ./src/tools/deploy.sh            # deploy + build + check
+    ./src/tools/deploy.sh --flash    # also reflash the Nano first
+    ./src/tools/deploy.sh --check-only
+    ./src/tools/deploy.sh --logs     # add container logs
+
+In Claude Code, the same thing is `/car` (see `.claude/commands/car.md`), which
+also reads the sensor table back and says what to fix.
+
+Override the address with `--host user@addr` or `PI_HOST`.
+
+### By hand
+
     scp -r src/ros2-package/sign_detector/* pi@100.115.88.108:/home/pi/sign_detector/
     ssh pi@100.115.88.108 "docker exec signstack bash -lc \
       'source /opt/ros/humble/setup.bash && cd /ros2_ws && \
