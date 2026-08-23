@@ -195,12 +195,12 @@ bool parseFinite(const char *s, float *out) {
 
 
 /* ---- ultrasonics ---------------------------------------------------------
- * Four HC-SR04 sharing one trigger on D4, echoes on A0..A3 (all PORTC, so a
+ * Four HC-SR04 sharing one trigger on D12, echoes on A0..A3 (all PORTC, so a
  * single pin-change vector serves all four). Everything is interrupt driven:
  * pulseIn() would block up to 30 ms per sensor and starve the drive watchdog
  * and serial parser in loop(), which is the code that stops the car.
  */
-static const uint8_t SONAR_TRIG_PIN = 4;
+static const uint8_t SONAR_TRIG_PIN = 12;
 static const uint8_t SONAR_N = 4;
 static const unsigned long SONAR_PERIOD_MS = 50;
 static const unsigned long SONAR_TIMEOUT_US = 25000UL;  /* ~4.2 m */
