@@ -52,6 +52,15 @@ sign_steering:
     drive_cruise_pct: 55.0
     slow_factor: 0.9
 
+start_button:
+  ros__parameters:
+    # Pi GPIO lines, not Nano pins. Both buttons are active-low against an
+    # internal pull-up, so each is just a switch to ground.
+    gpiochip: 4          # Pi 5 numbering; try 0 if the button never reads
+    line: 17             # START/STOP  -> header pin 11
+    mode_line: 27        # MODE select -> header pin 13
+    mode_button: true    # false leaves START on the open round only
+
 # open_round and imu run on their in-code defaults, which hold the tuned and
 # track-verified values. Add overrides here only deliberately; a stale copy of
 # this section once reverted a calibrated lidar offset.
