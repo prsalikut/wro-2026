@@ -1592,8 +1592,9 @@ RC_HTML = r"""<!doctype html>
 <header>
  <b>🎮 RC drive</b>
  <a class="back" href="/">← console</a>
- <span class="pill">pad <span id="gp" class="dim">none</span></span>
+ <span class="pill">pad <span id="gp" class="dim">scanning…</span></span>
  <span class="pill">link <span id="link" class="dim">?</span></span>
+ <button id="gpscan" onclick="scanGamepads();setTimeout(()=>{$('gp').textContent=pad()?'connected':'none — press controller button';$('gp').className=pad()?'ok':'dim';},300);" style="background:#1c2030;border:1px solid var(--line);color:var(--dim);padding:5px 9px;border-radius:6px;cursor:pointer;font-size:12px">↻ scan</button>
  <button id="engage" onclick="engage()">▶ ENGAGE</button>
  <button id="disarm" onclick="disarm()">■ disarm</button>
  <button id="estop" onclick="estop()">■ E-STOP</button>
@@ -1622,10 +1623,12 @@ RC_HTML = r"""<!doctype html>
   <div class="card">
    <h3>how to drive</h3>
    <div class="dim" style="line-height:1.7">
-    1. Press <b>ENGAGE</b> (stops autonomy, takes the wheel).<br>
-    2. <b>Hold the deadman</b> (gamepad <b>RB</b>, or keyboard <kbd>Shift</kbd>) — motor only runs while held.<br>
+    0. Click <b>"↻ scan"</b> then press any controller button to connect.<br>
+    1. Press <b>ENGAGE</b> (enter key) — stops autonomy, takes direct control.<br>
+    2. <b>Hold the deadman</b> (gamepad <b>RB</b> / keyboard <kbd>Shift</kbd>) — motor only runs while held.<br>
     3. Steer: <b>left stick</b> / <kbd>A</kbd><kbd>D</kbd> &nbsp; Throttle: <b>RT</b>/<b>LT</b> triggers / <kbd>W</kbd><kbd>S</kbd>.<br>
-    <kbd>Space</kbd> = E-STOP. Release deadman or the tab and the motor stops.
+    <kbd>Esc</kbd> = disarm &nbsp; <kbd>Space</kbd> = E-STOP.<br>
+    <span style="color:#ffb64d">Steam Deck:</span> run <code>flatpak override --user --device=all org.mozilla.firefox</code> once.
    </div>
   </div>
   <div class="card">
@@ -1664,24 +1667,35 @@ RC_HTML = r"""<!doctype html>
 const $=id=>document.getElementById(id);
 let cfg={thr:'trig',steerAxis:0,dead:5,invert:false,max:55,sens:1.0,expo:0.22};
 let armed=false, estopped=false, gpIdx=null, key={}, last={steer:0,drive:0,deadman:false};
+let gpPollId=null, gpEver=false;
 function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;
  document.body.appendChild(d);setTimeout(()=>d.remove(),4000);}
 
-// ---- gamepad ----
-addEventListener('gamepadconnected',e=>{gpIdx=e.gamepad.index;setGp(e.gamepad.id);});
-addEventListener('gamepaddisconnected',e=>{if(gpIdx===e.gamepad.index)gpIdx=null;setGp(null);});
-function pad(){return gpIdx!=null?(navigator.getGamepads?navigator.getGamepads()[gpIdx]:null):null;}
-function setGp(id){$('gp').textContent=id?String(id).slice(0,18):'none';
+// ---- gamepad (Steam Deck / Firefox proof) ----
+addEventListener('gamepadconnected',e=>{gpIdx=e.gamepad.index;gpEver=true;setGp(e.gamepad.id);});
+addEventListener('gamepaddisconnected',e=>{if(gpIdx===e.gamepad.index){gpIdx=null;gpEver=false;}setGp(null);});
+function scanGamepads(){const gps=navigator.getGamepads?navigator.getGamepads():null;if(!gps)return;
+ for(let i=0;i<gps.length;i++){if(gps[i]&&gps[i].connected){if(gpIdx!==i){gpIdx=i;gpEver=true;setGp(gps[i].id);}return;}}
+ gpIdx=null;}
+if(!gpPollId)gpPollId=setInterval(scanGamepads,1000);
+function pad(){const gps=navigator.getGamepads?navigator.getGamepads():null;
+ return(gpIdx!=null&&gps&&gps[gpIdx]&&gps[gpIdx].connected)?gps[gpIdx]:null;}
+function setGp(id){$('gp').textContent=id?String(id).slice(0,26):'none';
  $('gp').className=id?'ok':'dim';}
 function dz(x,d){return Math.abs(x)<(d||0.08)?0:x;}
 function expo(x,e){return (1-e)*x+e*x*x*x;}
+
+function readTriggers(p){var rt=0,lt=0;
+ if(p.buttons){rt=(p.buttons[7]||{}).value||0;lt=(p.buttons[6]||{}).value||0;}
+ if(rt===0&&lt===0&&p.axes&&p.axes.length>5){rt=p.axes[5]!==void 0?(p.axes[5]+1)/2:0;lt=p.axes[4]!==void 0?(p.axes[4]+1)/2:0;}
+ return{rt:Math.max(0,Math.min(1,rt)),lt:Math.max(0,Math.min(1,lt))};}
 
 function readControls(){
  let steer=0,thr=0,dead=false,src='keyboard';
  const p=pad();
  if(p){src='pad';
   steer=expo(dz(p.axes[cfg.steerAxis]||0),cfg.expo)*cfg.sens*(cfg.invert?-1:1);
-  if(cfg.thr==='trig'){const rt=(p.buttons[7]||{}).value||0,lt=(p.buttons[6]||{}).value||0;thr=rt-lt;}
+  if(cfg.thr==='trig'){var t=readTriggers(p);thr=t.rt-t.lt;}
   else thr=-dz(p.axes[3]||0,0.12);
   dead=!!((p.buttons[cfg.dead]||{}).pressed);
  } else {
@@ -1734,10 +1748,11 @@ function setBanner(){
  else if(last.deadman){b.className='banner b_armed';b.textContent='DRIVING — deadman held';}
  else{b.className='banner b_safe';b.textContent='ARMED — hold deadman to drive';}
 }
-function drawRaw(){const p=pad();if(!p)return;
+function drawRaw(){const p=pad();if(!p){$('raw').textContent='no gamepad detected — press any button on your controller…';return;}
  const ax=Array.from(p.axes).map((a,i)=>i+':'+a.toFixed(2)).join(' ');
- const bt=p.buttons.map((b,i)=>b.pressed?('['+i+']'):('') ).join('');
- $('raw').textContent='axes '+ax+'\nbtns '+(bt||'(none)')+'  RT'+(p.buttons[7]||{}).value+' LT'+(p.buttons[6]||{}).value;}
+ const bt=[];for(let i=0;i<(p.buttons||[]).length;i++){const b=p.buttons[i];if(b.pressed||b.value>0.1)bt.push(i+(b.value>0.1?':'+b.value.toFixed(2):''));}
+ var t=readTriggers(p);
+ $('raw').textContent='axes '+ax+'\nbtns ['+bt.join(' ')+']\nRT='+t.rt.toFixed(2)+' LT='+t.lt.toFixed(2);}
 requestAnimationFrame(frame);
 
 // ---- engage / disarm / estop ----
@@ -1752,9 +1767,10 @@ function updateBtns(){$('engage').style.display=armed?'none':'';
 updateBtns();
 
 // ---- keyboard ----
-addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+addEventListener('keydown',e=>{var k=e.key.toLowerCase();
  if(k===' '){e.preventDefault();estop();return;}
- if(k==='enter'){engage();return;}
+ if(k==='enter'){e.preventDefault();if(!armed)engage();return;}
+ if(k==='escape'){e.preventDefault();if(armed)disarm();return;}
  key[k]=true;
  if(['arrowup','arrowdown','arrowleft','arrowright'].includes(k))e.preventDefault();});
 addEventListener('keyup',e=>{key[e.key.toLowerCase()]=false;});

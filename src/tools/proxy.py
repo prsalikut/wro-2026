@@ -1,9 +1,9 @@
-"""TCP proxy: WSL localhost:8090 -> Pi 100.115.88.108:8080 (over Tailscale).
-Lets the Windows browser reach the Pi's MJPEG dashboard via WSL2 localhost forwarding."""
+"""TCP proxy: localhost:8090 -> Pi 8080 (over Tailscale).
+Lets the Steam Deck or any browser reach the Pi dashboard via localhost."""
 import socket, threading
 
 LADDR = ("0.0.0.0", 8090)
-RADDR = ("100.115.88.108", 8080)
+RADDR = ("raspberrypi", 8080)
 
 
 def pipe(a, b):
