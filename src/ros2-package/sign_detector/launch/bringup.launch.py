@@ -1,7 +1,7 @@
 """Bring up the whole stack: USB webcam + YDLIDAR X2 + sign detector + steering.
 Used as the container's default command.
 
-The steering pipeline (sign_steering -> steering_bridge -> Arduino) is included so
+The steering bridge (-> Arduino) is included; sign_steering is not (see below), so
 the WRO pass-rule behaviour comes up with the sensors: RED pillar -> keep RIGHT
 (steer +deg), GREEN pillar -> keep LEFT (steer -deg).  See config/params.yaml.
 """
@@ -91,15 +91,41 @@ def generate_launch_description():
             output='screen',
         ),
 
-        Node(
-            package='sign_detector', executable='sign_steering', name='sign_steering',
-            parameters=[cfg],
-            output='screen',
-        ),
+        # sign_steering deliberately not launched: it zeroes /drive_cmd whenever
+        # vision is quiet, which fights the RC console and open_round. Start it
+        # from the dashboard autonomy control only.
 
         Node(
             package='sign_detector', executable='steering_bridge', name='steering_bridge',
             parameters=[cfg],
             output='screen',
+        ),
+
+        Node(
+            package='sign_detector', executable='imu', name='imu',
+            parameters=[cfg],
+            output='screen',
+            respawn=True, respawn_delay=2.0,
+        ),
+
+        Node(
+            package='sign_detector', executable='line_detector', name='line_detector',
+            parameters=[cfg],
+            output='screen',
+            respawn=True, respawn_delay=2.0,
+        ),
+
+        Node(
+            package='sign_detector', executable='start_button', name='start_button',
+            parameters=[cfg],
+            output='screen',
+            respawn=True, respawn_delay=2.0,
+        ),
+
+        Node(
+            package='sign_detector', executable='sonar', name='sonar',
+            parameters=[cfg],
+            output='screen',
+            respawn=True, respawn_delay=2.0,
         ),
     ])

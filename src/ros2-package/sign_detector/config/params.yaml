@@ -2,7 +2,7 @@ sign_detector:
   ros__parameters:
     detector: "cnn"
     profile: "lab"
-    weights: "/home/pi/models/block_detection_model.tflite"
+    weights: "/ros2_ws/src/sign_detector/models/block_detection_model.tflite"
     conf: 0.4
     imgsz: 320
 
@@ -19,7 +19,8 @@ sign_detector:
 
     lidar_dx: -0.195
     angle_sign: 1.0
-    angle_offset_deg: -93.7
+    # re-measured 2026-08-22 after the lidar re-rig; was -93.7
+    angle_offset_deg: 170.0
     search_window_deg: 10.0
     match_tol_m: 0.25
     max_range_m: 2.0
@@ -38,7 +39,7 @@ steering_bridge:
     max_deg: 25.0
     rate_limit_dps: 0.0
     cmd_timeout_s: 1.0
-    drive_max_pct: 70.0
+    drive_max_pct: 100.0
     center_on_shutdown: true
 
 sign_steering:
@@ -50,3 +51,7 @@ sign_steering:
     clear_center_s: 0.7
     drive_cruise_pct: 55.0
     slow_factor: 0.9
+
+# open_round and imu run on their in-code defaults, which hold the tuned and
+# track-verified values. Add overrides here only deliberately; a stale copy of
+# this section once reverted a calibrated lidar offset.
