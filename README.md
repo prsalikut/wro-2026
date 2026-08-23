@@ -46,7 +46,9 @@ shared separately. The derived, labelled dataset in `other/dataset/` is committe
 | Arduino Nano | USB serial (FTDI) | `steering_bridge` → `S <deg>` / `M <pct>` commands |
 | Steering servo | Nano PWM | Firmware, commanded by `steering_bridge` |
 | BTS7960 + traction motor | Nano PWM | Firmware, commanded by `steering_bridge` |
-| MPU6050 IMU | Pi I2C (bus 1) | *Mounted, not yet enabled* — see Status |
+| IMU (BNO055 or MPU6050) | Pi I²C bus 1 | `imu` node, optional — auto-detected |
+| 4× HC-SR04 | Nano D4 trigger, A0–A3 echo | `sonar` node via the serial bridge |
+| Start button | Pi GPIO17 (pin 11) | `start_button` node |
 
 The split is deliberate: the Pi does all perception and decision-making, and the Nano does
 nothing but convert two numbers (steering angle, drive percent) into PWM. That keeps the
@@ -74,8 +76,16 @@ independent watchdog that stops the motor if the Pi stops talking.
 
 ### Driving
 
-- **`open_round_node.py`** — Open Challenge driver. LiDAR-only; steers away from walls it
-  can see and slows when something is ahead.
+- **`open_round_node.py`** — Open Challenge driver. A drive/turn/halt state machine that
+  centres in the lane on left-right range difference, takes corners on the mat's colour
+  lines (wall distance as backup), and stops after 12 corners. Optional gyro gives 90°
+  corner exit and heading hold; both disable themselves when no IMU is present.
+- **`sonar_node.py`** — republishes the Nano's four HC-SR04 ranges. These are the primary
+  source for lane centring, since they read the glossy walls the LiDAR cannot.
+- **`line_detector_node.py`** — finds the mat's orange and blue corner lines.
+- **`imu_node.py`** — BNO055 or MPU6050 over I²C, with hot-plug probing.
+- **`start_button_node.py`** — implements the WRO start procedure (rules 9.11/9.14):
+  boot into a waiting state, first press starts the round, a later press stops it.
 - **`sign_steering_node.py`** — Obstacle Challenge steering. Picks the nearest in-range
   pillar and applies the pass rule. Note it consumes **only** `/traffic_signs` and has no
   wall avoidance, so it is not used for the Open Challenge.
@@ -161,11 +171,30 @@ docker exec signstack bash -lc 'source /opt/ros/humble/setup.bash && ros2 node l
 Expect: `/camera`, `/ydlidar`, `/base_to_laser`, `/sign_detector`, `/steering_bridge`,
 `/viz_server`. Then open `http://<pi-address>:8080` for the dashboard.
 
-### 6. Flash the Nano
+### 6. Start the web dashboard
+
+The dashboard is launched by the stack, but it can be run standalone:
+
+```bash
+docker exec -d signstack bash -lc \
+  'source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && \
+   python3 /ros2_ws/src/sign_detector/tools/viz_server.py'
+```
+
+Open **http://\<pi\>:8080** — three modes: desktop, assembly, final. The gamepad RC
+console is at `/rc`.
+
+### 7. Flash the Nano
 
 ```bash
 cd src/arduino && ./flash.sh
 ```
+
+### 8. Other checks
+
+`src/tools/smoke_test.py` is the quick "is anything publishing?" check.
+`src/tools/auto_calib.py` re-derives the camera-LiDAR angle offset.
+`src/tools/grab_frame.py` grabs a single camera frame for offline inspection.
 
 ---
 
@@ -192,15 +221,16 @@ defines where "forward" is, and every steering decision depends on it.
 
 Recorded honestly, because these affect how the car behaves:
 
-- **The LiDAR struggles to see the track walls.** The walls are glossy black, which at the
-  sensor's 905 nm wavelength reflects almost specularly — beams arriving at a grazing angle
-  bounce away instead of returning. A wall straight ahead returns reliably; walls to the
-  side often return nothing. Camera-based wall detection is the planned remedy, since a
-  black wall against a white mat is a high-contrast target.
-- **The IMU is mounted but not active.** The MPU6050 is fitted, but the Pi's I2C bus is not
-  yet enabled (`dtparam=i2c_arm=on`), so no `imu/data` topic is published yet.
-- **Open Challenge is not yet reliable.** `open_round_node` steers correctly on the data it
-  receives, but with the wall returns above it does not yet complete laps consistently.
+- **The LiDAR cannot see the side walls reliably.** They are glossy black, which at 905 nm
+  reflects almost specularly: a wall straight ahead returns rock-steady, a wall alongside
+  returns little or nothing. Measured on the mat, bearings that did return read up to
+  7.08 m on a 3 m field. Ultrasonics were added for exactly this reason — sound does not
+  care about surface gloss, and a side-mounted sensor faces its wall square on.
+- **The drivetrain stalls from rest.** 12% duty does not move the car, 30% lurches then
+  stalls, ~100% for about a second breaks it free. The driver kicks then drops to a low
+  sustain duty; a kick is only started with clear room ahead, because it travels ~0.6 m.
+- **Open Challenge is not yet verified over three full laps on hardware.** The controller
+  passes closed-loop simulation with zero collisions.
 - **`sign_steering` is not started by `bringup.launch.py`.** It zeroes `/drive_cmd` whenever
   vision is quiet, which fights the RC console, so it is started deliberately from the
   dashboard instead of automatically.
