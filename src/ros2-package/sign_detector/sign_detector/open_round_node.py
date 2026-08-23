@@ -109,7 +109,7 @@ class OpenRound(Node):
             ("sonar_centre", True),
             ("sonar_front_guard", True),
             ("fuse_tol_m", 0.22),
-            ("sonar_weight", 0.7),
+            ("sonar_weight", 1.0),   # ultrasonic-only side centring
             ("centre_kd", 9.0),
             ("stop_after_turns", 12),
             ("clear_m", 1.20),

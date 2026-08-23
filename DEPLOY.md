@@ -64,6 +64,25 @@ Override the address with `--host user@addr` or `PI_HOST`.
 
 ## 5. Known follow-ups
 
+- **Right and front sonar read wrong (2026-08-23, measured on hardware).**
+  Right sat at exactly 0.43 m for 213 consecutive samples while the lidar put
+  the nearest object on that side at 2.94 m. Front read ~0.93-1.47 m against a
+  lidar front of 2.27 m -- under `turn_m` (1.10), so the car believes it is at a
+  corner permanently, turns into the wall, and `reverse_enable` backs it into
+  the wall behind. Reseat ECHO on A1 (right) and A0 (front) with 5V/GND, or swap
+  the sensors. Order is front/right/rear/left = A0/A1/A2/A3.
+- **`open_round` has no start gate.** It does not subscribe to `start_status`,
+  so it drives the instant it launches and the START button does nothing for the
+  open round. WRO requires starting on a button press; this needs fixing before
+  a competition run.
+- **`angle_offset_deg` (170.0) is unverified on the track.** If it is wrong the
+  chassis frame is rotated, "front" is not front, and the car halts and reverses
+  against a wall it thinks is ahead. Confirm before trusting a round: sweep
+  candidate offsets and pick the one where front is the largest open gap and
+  left/right are roughly equal.
+- IMU does not respond (`Errno 121` on I2C). Check S0 and S1 are each bridged to
+  GND for address 0x28. Heading hold and gyro corners stay off without it.
+
 - `start_button` defaults to `gpiochip4`; if the button never reads, try
   `gpiochip0`. Needs `lgpio` or `python3-libgpiod` in the container.
 - `sonar` sends one `USON` at startup. Every `arduino_cmd` opens a manual window
