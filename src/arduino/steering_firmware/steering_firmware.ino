@@ -193,6 +193,91 @@ bool parseFinite(const char *s, float *out) {
   return true;
 }
 
+
+/* ---- ultrasonics ---------------------------------------------------------
+ * Four HC-SR04 sharing one trigger on D4, echoes on A0..A3 (all PORTC, so a
+ * single pin-change vector serves all four). Everything is interrupt driven:
+ * pulseIn() would block up to 30 ms per sensor and starve the drive watchdog
+ * and serial parser in loop(), which is the code that stops the car.
+ */
+static const uint8_t SONAR_TRIG_PIN = 4;
+static const uint8_t SONAR_N = 4;
+static const unsigned long SONAR_PERIOD_MS = 50;
+static const unsigned long SONAR_TIMEOUT_US = 25000UL;  /* ~4.2 m */
+
+volatile unsigned long sonarRise[SONAR_N];
+volatile unsigned long sonarWidth[SONAR_N];
+volatile uint8_t sonarPrev = 0;
+static unsigned long sonarFiredUs = 0;
+static unsigned long sonarLastMs = 0;
+static bool sonarStream = false;
+static unsigned long sonarReportMs = 0;
+
+ISR(PCINT1_vect) {
+  uint8_t now = PINC & 0x0F;
+  uint8_t changed = now ^ sonarPrev;
+  sonarPrev = now;
+  if (!changed) return;
+  unsigned long t = micros();
+  for (uint8_t i = 0; i < SONAR_N; i++) {
+    uint8_t m = (uint8_t)(1 << i);
+    if (!(changed & m)) continue;
+    if (now & m) sonarRise[i] = t;
+    else if (sonarRise[i]) { sonarWidth[i] = t - sonarRise[i]; sonarRise[i] = 0; }
+  }
+}
+
+void sonarBegin() {
+  pinMode(SONAR_TRIG_PIN, OUTPUT);
+  digitalWrite(SONAR_TRIG_PIN, LOW);
+  for (uint8_t i = 0; i < SONAR_N; i++) {
+    pinMode(A0 + i, INPUT);
+    sonarRise[i] = 0;
+    sonarWidth[i] = 0;
+  }
+  sonarPrev = PINC & 0x0F;
+  PCICR |= (1 << PCIE1);
+  PCMSK1 |= 0x0F;
+}
+
+/* Fire all four at once. They face outward in different directions, so
+ * cross-talk is minimal; a stale reading is discarded by the age check. */
+void sonarService(unsigned long now) {
+  if ((now - sonarLastMs) < SONAR_PERIOD_MS) return;
+  sonarLastMs = now;
+  sonarFiredUs = micros();
+  digitalWrite(SONAR_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SONAR_TRIG_PIN, LOW);
+
+  /* Streaming is opt-in: unsolicited lines would otherwise interleave with
+   * command replies on a link the bridge also uses for steering and drive. */
+  if (sonarStream && (now - sonarReportMs) >= SONAR_PERIOD_MS) {
+    sonarReportMs = now;
+    sonarReport();
+  }
+}
+
+/* cm, or -1 when the last ping produced no usable echo */
+int sonarCm(uint8_t i) {
+  unsigned long w;
+  uint8_t sreg = SREG;
+  cli();
+  w = sonarWidth[i];
+  SREG = sreg;
+  if (w == 0 || w > SONAR_TIMEOUT_US) return -1;
+  return (int)(w / 58UL);
+}
+
+void sonarReport() {
+  Serial.print("US");
+  for (uint8_t i = 0; i < SONAR_N; i++) {
+    Serial.print(' ');
+    Serial.print(sonarCm(i));
+  }
+  Serial.println();
+}
+
 /* ---- command parser ------------------------------------------------------ */
 void handleLine(char *line) {
   char *verb = strtok(line, " \t");
@@ -307,6 +392,17 @@ void handleLine(char *line) {
     feedDriveDeadman();
     Serial.println("OK ARM");
 
+  } else if (strcmp(verb, "US") == 0) {
+    sonarReport();
+
+  } else if (strcmp(verb, "USON") == 0) {
+    sonarStream = true;
+    Serial.println("OK USON");
+
+  } else if (strcmp(verb, "USOFF") == 0) {
+    sonarStream = false;
+    Serial.println("OK USOFF");
+
   } else if (strcmp(verb, "GET") == 0) {
     Serial.print("STATE angle="); Serial.print(curDeg, 1);
     Serial.print(" trim=");       Serial.print(trimDeg, 1);
@@ -330,6 +426,7 @@ void setup() {
 
   /* Motor pins first, and explicitly stopped, before anything else can run.
    * Boot must never produce torque. */
+  sonarBegin();
   pinMode(RPWM_PIN, OUTPUT);
   pinMode(LPWM_PIN, OUTPUT);
   pinMode(REN_PIN, OUTPUT);
@@ -391,5 +488,6 @@ void loop() {
     Serial.println("WD center stop");
   }
 
+  sonarService(now);
   driveSlew(now);
 }

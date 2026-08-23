@@ -16,3 +16,11 @@ Pi8080
 .idea/
 .DS_Store
 Thumbs.db
+
+# local tooling config with machine-specific absolute paths
+.claude/
+other/dataset/wro_dataset.zip
+
+# local tooling config, machine-specific absolute paths
+.claude/
+other/dataset/wro_dataset.zip

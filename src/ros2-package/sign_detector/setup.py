@@ -25,6 +25,13 @@ setup(
             'sign_detector = sign_detector.sign_detector_node:main',
             'steering_bridge = sign_detector.steering_node:main',
             'sign_steering = sign_detector.sign_steering_node:main',
+            'open_round = sign_detector.open_round_node:main',
+            'imu = sign_detector.imu_node:main',
+            'line_detector = sign_detector.line_detector_node:main',
+            'start_button = sign_detector.start_button_node:main',
+            'sonar = sign_detector.sonar_node:main',
+            'sim_open_round = sign_detector.sim_open_round_node:main',
+            'train_recorder = sign_detector.train_recorder_node:main',
         ],
     },
 )

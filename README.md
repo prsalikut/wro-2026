@@ -1,111 +1,218 @@
-# WRO 2026 — Future Engineers — Red/Green Sign Detection
+# WRO 2026 — Future Engineers — Self-Driving Car
 
-Perception stack for the self-driving car: detect **red and green traffic-sign pillars**
-from a webcam, fuse each detection's bearing with LiDAR range, and publish a 3D pose the
-navigation layer can act on. Pass rule (rules §9.19) — **red → keep to the lane's RIGHT
-(steer right; the pillar passes on the car's left); green → keep LEFT (steer left)**.
+Autonomous 1:10-scale vehicle for the WRO 2026 Future Engineers challenge. The car drives
+the Open Challenge using LiDAR, and the Obstacle Challenge by detecting the red and green
+traffic-sign pillars with a camera, fusing each detection's bearing with a LiDAR range, and
+steering to the correct side of the lane.
 
-Runs live on a **Raspberry Pi 5 (4 GB)** as **ROS 2 Humble inside Docker** (host is Raspberry
-Pi OS / Debian 13), with a **USB webcam** + **YDLIDAR X2**.
+Everything runs on a **Raspberry Pi 5 (4 GB)** as **ROS 2 Humble inside Docker** (host is
+Raspberry Pi OS / Debian 13). A **USB webcam** and a **YDLIDAR X2** provide perception; an
+**Arduino Nano** drives the steering servo and the traction motor over a serial link.
 
-## Folder guide
+**Pass rule (rules §9.19):** a **red** pillar means keep to the lane's **RIGHT** (steer
+right, so the pillar passes on the car's left); a **green** pillar means keep **LEFT**.
 
-| Folder | What's in it |
+---
+
+## Repository layout
+
+This repository follows the WRO Future Engineers template structure.
+
+| Folder | Contents |
 |---|---|
-| `ros2-package/sign_detector/` | The ROS 2 package that runs on the robot — HSV + YOLO detectors, the fusion node (`vision_msgs/Detection3DArray` + RViz markers), launch files, and the `docker/` build (Dockerfile, compose, bringup launch with the X2 driver). **This is the deliverable that's deployed to the Pi.** |
-| `dataset/` | `wro_dataset/` — auto-labeled YOLO dataset from the training photos (102 labeled, 86 red + 78 green boxes), plus `wro_dataset.zip` for Roboflow. |
-| `training-images/` | 142 real photos of the practice blocks (+ original zip). **Not included here** — ~2 GB, shared separately. |
-| `prototyping/` | `WRO_sign_detector.ipynb` (Colab: YOLO11n on synthetic data → NCNN/TFLite), `red_green_test.py` (minimal standalone HSV tester), and dev/diagnostic images. |
-| `screenshots/` | Live detection results off the Pi, plus `detection_gallery.html` (open in a browser). |
-| `rules/` | The official WRO 2026 FE rules PDF. |
+| `src/ros2-package/` | The ROS 2 package deployed to the car — detectors, sensor fusion, driving nodes, the serial bridge, launch files, and the Docker build. **This is the deliverable.** |
+| `src/arduino/` | Firmware for the Arduino Nano (steering servo + BTS7960 traction motor), plus a flashing script. |
+| `src/tools/` | Host- and Pi-side utilities: the web dashboard / RC console, calibration helpers, frame grabbers, smoke tests. |
+| `schemes/` | Electromechanical wiring diagrams. |
+| `models/` | 3D-printed / laser-cut part files. |
+| `t-photos/`, `v-photos/`, `video/` | Team photos, vehicle photos, driving demonstration video. |
+| `other/dataset/` | YOLO-format dataset auto-labelled from practice photos (164 labelled boxes: 86 red, 78 green). |
+| `other/prototyping/` | Colab notebook and standalone experiments used while developing the detector. |
+| `other/screenshots/` | Live detection results captured from the car. |
+| `other/rules/` | The official WRO 2026 FE rules PDF. |
 
-## Key facts
+`training-images/` (~2 GB of raw practice photos) is intentionally **not** committed; it is
+shared separately. The derived, labelled dataset in `other/dataset/` is committed instead.
 
-- **Official sign colors:** red RGB (238,39,55), green RGB (68,214,44); pillars 50×50×100 mm.
-- **Practice blocks ≠ official pillars:** the training photos are warm-lit cardboard, so red
-  reads orange (OpenCV hue ~4–16) and green yellow-green (hue ~32–40). The detector uses a
-  high **saturation** floor to separate red from the floor/wood. Switch `PROFILE`/`profile` to
-  `"official"` and recalibrate at the venue.
+---
 
-## Setup — start here
+## Hardware and how the software maps onto it
 
-### What you need
+| Component | Interface | Software that owns it |
+|---|---|---|
+| Raspberry Pi 5 (4 GB) | — | Runs the whole ROS 2 graph inside the `signstack` container |
+| USB webcam | USB (V4L2) | `v4l2_camera` node → `/image_raw` |
+| YDLIDAR X2 | USB serial | `ydlidar_ros2_driver` → `/scan` |
+| Arduino Nano | USB serial (FTDI) | `steering_bridge` → `S <deg>` / `M <pct>` commands |
+| Steering servo | Nano PWM | Firmware, commanded by `steering_bridge` |
+| BTS7960 + traction motor | Nano PWM | Firmware, commanded by `steering_bridge` |
+| MPU6050 IMU | Pi I2C (bus 1) | *Mounted, not yet enabled* — see Status |
 
-- Raspberry Pi 5 (4 GB) running Raspberry Pi OS / Debian 13, with Docker installed
-- USB webcam, YDLIDAR X2, Arduino Nano (steering), all plugged into the Pi
-- On your laptop: `git`, plus the Arduino IDE or `arduino-cli` if you plan to reflash the Nano
+The split is deliberate: the Pi does all perception and decision-making, and the Nano does
+nothing but convert two numbers (steering angle, drive percent) into PWM. That keeps the
+safety-critical actuation path small enough to audit, and lets the firmware run an
+independent watchdog that stops the motor if the Pi stops talking.
 
-### 1. Get the code onto the Pi
+---
+
+## Software modules
+
+### Perception
+
+- **`sign_detector_node.py`** — the fusion node. Takes camera detections and, for each one,
+  searches `/scan` around the expected bearing for a matching range, then publishes a
+  `vision_msgs/Detection3DArray` on `/traffic_signs` plus RViz markers. The camera gives a
+  precise bearing but a poor distance; the LiDAR gives a precise distance but cannot tell
+  red from green. Fusing them yields a 3D pose with both.
+- **`cnn_block_detector.py`** — the active detector. Localises saturated, block-shaped blobs
+  in LAB colour space, then classifies each crop with a 64×64 2-class CNN
+  (`index 0 = green, index 1 = red`) running on TFLite.
+- **`block_detector.py`** — the original HSV detector. **Superseded**: it triggers on the
+  orange track mat and on skin tones, because plain colour thresholds cannot distinguish a
+  red pillar from anything else reddish in frame.
+- **`ml_block_detector.py`** — thin wrapper for the optional YOLO path.
+
+### Driving
+
+- **`open_round_node.py`** — Open Challenge driver. LiDAR-only; steers away from walls it
+  can see and slows when something is ahead.
+- **`sign_steering_node.py`** — Obstacle Challenge steering. Picks the nearest in-range
+  pillar and applies the pass rule. Note it consumes **only** `/traffic_signs` and has no
+  wall avoidance, so it is not used for the Open Challenge.
+- **`follow_block_node.py`** — development helper that drives toward a chosen block.
+
+### Actuation and safety
+
+- **`steering_node.py`** (`steering_bridge`) — the only node that talks to the Nano. It
+  applies a direction flip and a mechanical limit, then forwards `S <deg>` / `M <pct>`. It
+  re-sends the current angle at least every 0.5 s so the firmware watchdog never trips
+  during normal operation, and it zeroes the motor if commands go stale for longer than
+  `cmd_timeout_s`. A manual window suspends autonomous forwarding while the RC console is
+  in use, so the two cannot fight over the actuators.
+
+### Tools
+
+- **`tools/viz_server.py`** — web dashboard on port 8080: live camera and LiDAR views, a
+  pre-flight checklist, stack start/stop, an E-stop, and a gamepad RC console (`/rc`) used
+  for manual driving.
+- **`tools/auto_calib.py`**, **`grab_frame.py`**, **`smoke_test.py`**, **`proxy.py`** —
+  calibration, single-frame capture, end-to-end checks, and a TCP proxy for remote access.
+
+### Firmware
+
+`src/arduino/steering_firmware` — accepts a small command set over serial (`S` steering,
+`M` motor, `C` centre, `ARM`, `E` e-stop, `WD`/`DWD` watchdogs, `GET` state, `PING`), with
+an independent watchdog that stops the motor if the Pi goes quiet.
+
+---
+
+## Build and run
+
+### Prerequisites
+
+- Raspberry Pi 5 (4 GB), Raspberry Pi OS / Debian 13, Docker installed
+- USB webcam, YDLIDAR X2, Arduino Nano — all connected to the Pi
+- On a workstation: `git`, and `arduino-cli` or the Arduino IDE to flash the Nano
+
+### 1. Deploy the code
 
 ```bash
 git clone <this-repo-url> ~/sign_detector-repo
-cp -r ~/sign_detector-repo/ros2-package/sign_detector ~/sign_detector
+cp -r ~/sign_detector-repo/src/ros2-package/sign_detector ~/sign_detector
 cd ~/sign_detector
 ```
 
-### 2. Build and run the stack
+### 2. Build the image
 
 ```bash
 docker build -f docker/Dockerfile -t sign_detector:humble .
+```
 
+### 3. Run the stack
+
+```bash
 docker run -d --name signstack --network host --ipc host --privileged \
   -v /dev:/dev -v ~/sign_detector:/ros2_ws/src/sign_detector \
-  sign_detector:humble ros2 launch sign_detector bringup.launch.py
+  --restart unless-stopped \
+  sign_detector:humble \
+  bash -lc 'source /opt/ros/humble/setup.bash && \
+            source /ros2_ws/install/setup.bash && \
+            exec ros2 launch sign_detector bringup.launch.py'
 ```
 
-`bringup.launch.py` starts everything: the X2 LiDAR driver, the camera, the detector, the
-fusion node, `sign_steering` (pass rule) and `steering_bridge` (serial to the Nano).
+`~/sign_detector` is bind-mounted into the workspace, so edits on the Pi take effect after
+a rebuild without rebuilding the image.
 
-Check it came up:
+### 4. Rebuild after changing Python nodes
 
 ```bash
-docker logs -f signstack
-docker exec -it signstack bash -lc 'source /opt/ros/humble/setup.bash && ros2 topic list'
+docker exec signstack bash -lc \
+  'source /opt/ros/humble/setup.bash && cd /ros2_ws && \
+   colcon build --packages-select sign_detector --symlink-install'
+docker restart signstack
 ```
 
-Topics you should see: `/image_raw`, `/scan`, `/traffic_signs`, `/sign_debug`, `/steering_cmd`.
-
-Stop it with `docker stop signstack` (and `docker rm signstack` before re-running).
-
-### 3. Flash the Arduino (only if the firmware changed)
+### 5. Verify
 
 ```bash
-cd arduino
-./flash.sh              # see the script for the port it expects
+docker exec signstack bash -lc 'source /opt/ros/humble/setup.bash && ros2 node list'
 ```
 
-The Nano enumerates as an FTDI device. If `flash.sh` can't find it, list ports with
-`ls /dev/serial/by-id/` and pass the right one.
+Expect: `/camera`, `/ydlidar`, `/base_to_laser`, `/sign_detector`, `/steering_bridge`,
+`/viz_server`. Then open `http://<pi-address>:8080` for the dashboard.
 
-### 4. Watch it work
+### 6. Flash the Nano
 
-`tools/viz_server.py` serves a live view of the detections in a browser — run it on the Pi
-and open the printed URL from your laptop. `tools/smoke_test.py` is the quick "is anything
-publishing?" check, and `tools/auto_calib.py` re-derives the camera↔LiDAR angle offset.
+```bash
+cd src/arduino && ./flash.sh
+```
 
-### Tuning
+---
 
-All the knobs live in `ros2-package/sign_detector/config/params.yaml` — HSV bands, the
-detector backend (`hsv` / `cnn`), `sign_height_m`, and the steering limits. **You will need
-to recalibrate the HSV values at the venue**, because the practice blocks and the official
-pillars are different colors (see Key facts above).
+## Configuration
 
-### A note on the training images
+All runtime tuning lives in `src/ros2-package/sign_detector/config/params.yaml`, applied
+per node. The values that matter most:
 
-`training-images/` and the dataset zip are **not in this repo** — they're ~2 GB, well past
-what GitHub accepts. Ask for them separately if you need to retrain; nothing in the runtime
-stack depends on them.
+| Parameter | Meaning |
+|---|---|
+| `detector` | `cnn` (active) or `hsv` (superseded) |
+| `weights` | Path to the `.tflite` model **as seen inside the container** |
+| `angle_offset_deg` | Rotation between the LiDAR's zero and the car's forward axis |
+| `steer_dir`, `max_deg` | Steering direction flip and mechanical limit |
+| `drive_max_pct` | Hard ceiling on motor duty |
+| `cmd_timeout_s` | How long a stale command is tolerated before the motor stops |
 
-## Status
+`angle_offset_deg` is the one to check first after any change to the LiDAR mounting: it
+defines where "forward" is, and every steering decision depends on it.
 
-- ✅ Camera + X2 + detector up in one container; red & green classified with bearings;
-  `/traffic_signs` publishing 3D poses; camera color cast fixed.
-- ✅ Camera↔LiDAR angle calibrated (`angle_sign`/`angle_offset_deg`, auto_calib 2026-07-11);
-  fusion matcher fixed to take the nearest plausible cluster, so the range reads the
-  pillar, not the wall behind it.
-- ✅ Steering live end-to-end (2026-07-11): `bringup.launch.py` also starts `sign_steering`
-  (pass rule → `/steering_cmd`) and `steering_bridge` (serial → Arduino Nano, `arduino/`
-  firmware). Servo throw calibrated to ±600 µs (DEG2US 24, `S ±25` = full lock); layered
-  failsafes: vision-quiet centering, stale-command centering, firmware watchdog.
-- ⏳ Next: drive motor (BTS7960, phase 2); optionally fine-tune the YOLO model on real
-  images; recalibrate HSV + `sign_height_m` at the venue on the official pillars.
+---
+
+## Status and known issues
+
+Recorded honestly, because these affect how the car behaves:
+
+- **The LiDAR struggles to see the track walls.** The walls are glossy black, which at the
+  sensor's 905 nm wavelength reflects almost specularly — beams arriving at a grazing angle
+  bounce away instead of returning. A wall straight ahead returns reliably; walls to the
+  side often return nothing. Camera-based wall detection is the planned remedy, since a
+  black wall against a white mat is a high-contrast target.
+- **The IMU is mounted but not active.** The MPU6050 is fitted, but the Pi's I2C bus is not
+  yet enabled (`dtparam=i2c_arm=on`), so no `imu/data` topic is published yet.
+- **Open Challenge is not yet reliable.** `open_round_node` steers correctly on the data it
+  receives, but with the wall returns above it does not yet complete laps consistently.
+- **`sign_steering` is not started by `bringup.launch.py`.** It zeroes `/drive_cmd` whenever
+  vision is quiet, which fights the RC console, so it is started deliberately from the
+  dashboard instead of automatically.
+
+---
+
+## Documentation checklist
+
+Per the WRO Future Engineers rules, still to be added:
+
+- [ ] `t-photos/` — official and funny team photos
+- [ ] `v-photos/` — six vehicle photos (front, back, left, right, top, bottom)
+- [ ] `video/video.md` — public link to the driving demonstration
+- [ ] `schemes/` — electromechanical wiring diagram
+- [ ] `models/` — 3D-printed / laser-cut part files
