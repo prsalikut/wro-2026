@@ -1,5 +1,5 @@
-"""Lidar-driven state machine for the WRO Future Engineers open round.
-Drives the lap (drive -> turn -> halt/backout) with kick-start motor control."""
+"""State machine for the WRO Future Engineers open round: drive -> turn -> halt/backout.
+Fuses ultrasonic range, lidar and IMU heading; each degrades independently."""
 import json
 import math
 
@@ -70,6 +70,9 @@ class OpenRound(Node):
         self.hold_yaw = None
         self.sonar = {"front": None, "rear": None, "left": None, "right": None}
         self.sonar_t = {k: -1e9 for k in self.sonar}
+        self.err_prev = None
+        self.err_t = -1e9
+        self.disagree = {"left": False, "right": False}
         self.t_start = self._now()
         self._last_log = 0.0
         self._last_key = None
@@ -105,6 +108,9 @@ class OpenRound(Node):
             ("sonar_timeout_s", 0.4),
             ("sonar_centre", True),
             ("sonar_front_guard", True),
+            ("fuse_tol_m", 0.22),
+            ("sonar_weight", 0.7),
+            ("centre_kd", 9.0),
             ("stop_after_turns", 12),
             ("clear_m", 1.20),
             ("resume_m", 0.76),
@@ -170,6 +176,9 @@ class OpenRound(Node):
         self.sonar_timeout = float(g("sonar_timeout_s"))
         self.sonar_centre = bool(g("sonar_centre"))
         self.sonar_front_guard = bool(g("sonar_front_guard"))
+        self.fuse_tol = float(g("fuse_tol_m"))
+        self.sonar_w = float(g("sonar_weight"))
+        self.c_kd = float(g("centre_kd"))
         self.stop_turns = int(g("stop_after_turns"))
         self.clear = float(g("clear_m"))
         self.resume = float(g("resume_m"))
@@ -220,6 +229,27 @@ class OpenRound(Node):
         if (self._now() - self.sonar_t[side]) > self.sonar_timeout:
             return None
         return self.sonar[side]
+
+    def _fuse_side(self, side, lidar):
+        """Combine sonar and lidar for one side.
+
+        Ultrasound reads these walls under conditions where the lidar cannot,
+        so it carries the larger weight, but the lidar still contributes when
+        the two agree. A wide disagreement means one of them is wrong rather
+        than both being noisy, and the sonar is the one that survives grazing
+        incidence on a glossy surface."""
+        sonar = self.sonar_get(side) if self.sonar_centre else None
+        if lidar is not None and lidar > self.c_valid:
+            lidar = None
+        self.disagree[side] = False
+        if sonar is not None and lidar is not None:
+            if abs(sonar - lidar) <= self.fuse_tol:
+                return self.sonar_w * sonar + (1.0 - self.sonar_w) * lidar
+            self.disagree[side] = True
+            return sonar
+        if sonar is not None:
+            return sonar
+        return lidar
 
     def on_yaw(self, msg):
         self.yaw_deg = float(msg.data)
@@ -328,18 +358,8 @@ class OpenRound(Node):
 
     def _nudge(self):
         """Proportional lane centring on side ranges. + = steer RIGHT."""
-        l = r = None
-        if self.sonar_centre:
-            l, r = self.sonar_get("left"), self.sonar_get("right")
-        # Sonar reads these walls reliably where the lidar does not: glossy
-        # black returns almost nothing at grazing angles, and a side-mounted
-        # sonar faces its wall square on. Fall back to lidar per side.
-        if l is None:
-            l = (self.left if self.left is not None
-                 and self.left <= self.c_valid else None)
-        if r is None:
-            r = (self.right if self.right is not None
-                 and self.right <= self.c_valid else None)
+        l = self._fuse_side("left", self.left)
+        r = self._fuse_side("right", self.right)
         if l is not None and r is not None:
             err = r - l
         elif l is not None:
@@ -349,7 +369,21 @@ class OpenRound(Node):
         else:
             return 0.0
         err += self.c_bias * (-self.turn_dir)
-        return max(-self.c_max, min(self.c_max, self.c_kp * err))
+
+        # Derivative of the centring error is a heading estimate the ranges can
+        # supply on their own, so the car still damps its approach to a wall
+        # when no IMU is fitted. With an IMU the two are complementary: this
+        # reacts to lateral drift, heading hold holds the absolute bearing.
+        now = self._now()
+        dt = now - self.err_t
+        rate = 0.0
+        if self.err_prev is not None and 1e-3 < dt < 0.5:
+            rate = (err - self.err_prev) / dt
+        self.err_prev = err
+        self.err_t = now
+
+        steer = self.c_kp * err + self.c_kd * rate
+        return max(-self.c_max, min(self.c_max, steer))
 
     def _halt(self, reason):
         if self.state != "halt":
@@ -521,6 +555,9 @@ class OpenRound(Node):
             "yaw_rate": _r(self.yaw_rate),
             "yaw": _r(self.yaw_deg), "hold_yaw": _r(self.hold_yaw),
             "sonar": {k: _r(self.sonar_get(k)) for k in self.sonar},
+            "fused_l": _r(self._fuse_side("left", self.left)),
+            "fused_r": _r(self._fuse_side("right", self.right)),
+            "disagree": dict(self.disagree),
             "run_s": round(now - self.t_start, 1),
         })))
         self._log(state, "{} F={} L={} R={} turns={} -> {:+.1f}deg {:.0f}%".format(

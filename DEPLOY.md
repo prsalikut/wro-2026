@@ -53,11 +53,25 @@ the drive watchdog and serial parser never block.
 - The bridge's `RAW_ALLOWED` whitelist lives in the Pi's newer `steering_node.py`
   (not the repo copy). `USON`/`USOFF` may need adding there, and read-only verbs
   (`PING`, `GET`, `US`) should be exempted from opening a manual window.
-- Sonar is now the PRIMARY source for lane centring, front guard and backout,
-  with lidar as per-side fallback. Disable via `sonar_centre:=false` /
-  `sonar_front_guard:=false` if a sensor misbehaves.
-- The car drives without an IMU: no gyro simply disables heading hold and
-  angle-based corner exit. Sonar left/right carry lane keeping on their own.
+### Sensor roles (complementary, not a fallback chain)
+
+| Sensor | Role | Degrades to |
+|---|---|---|
+| Ultrasonic L/R | trusted side range, larger fusion weight | lidar side, if credible |
+| Lidar | front distance, corner detection, obstacle round | sonar front guard |
+| IMU | heading reference: 90 deg corner exit, heading hold | error-derivative damping |
+
+`_fuse_side` weights sonar 0.7 against lidar 0.3 when the two agree within
+`fuse_tol_m` (0.22). Beyond that it flags a disagreement and takes the sonar,
+because grazing incidence on glossy black is the known lidar failure and it
+reads long, never short. Disagreements are published in `open_status` — watch
+that field on the first runs, it is the fastest way to spot a mis-wired sensor.
+
+Front uses the NEAREST of lidar and sonar so either can stop the car.
+
+Each degrades independently: no IMU loses heading hold but keeps derivative
+damping from the ranges; no sonar falls back to lidar sides; no lidar keeps
+sonar centring and the sonar front guard.
 
 ## What changed since the last working state
 
