@@ -34,6 +34,31 @@ pick_port() {
     nano|nano-old) pref='FTDI|FT232|USB_Serial|CH340|1a86|wch' ;;
   esac
 
+  # macOS has no /dev/serial/by-id, and the CP210x lidar and the FTDI Nano both
+  # appear as /dev/cu.usbserial-<serial>, so the name cannot tell them apart.
+  # One port is unambiguous; with several, make the operator pick.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    local found="" n=0
+    for link in /dev/cu.usbserial-* /dev/cu.usbmodem*; do
+      [ -e "$link" ] || continue
+      found="$found$link
+"
+      n=$((n + 1))
+    done
+    if [ "$n" -eq 1 ]; then
+      link="${found%$'\n'}"
+      echo "  matched (only USB serial port): $link" >&2
+      echo "$link"
+      return 0
+    fi
+    if [ "$n" -gt 1 ]; then
+      echo "  several USB serial ports here, and the lidar looks like the Nano;" >&2
+      echo "  pass the right one explicitly:" >&2
+      printf '%s' "$found" | sed 's/^/    /' >&2
+    fi
+    return 1
+  fi
+
   if [ -d /dev/serial/by-id ]; then
     for link in /dev/serial/by-id/*; do
       [ -e "$link" ] || continue

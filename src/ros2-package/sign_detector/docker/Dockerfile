@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-opencv \
       python3-numpy \
       python3-serial \
+      python3-libgpiod \
       python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
