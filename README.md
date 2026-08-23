@@ -48,7 +48,8 @@ shared separately. The derived, labelled dataset in `other/dataset/` is committe
 | BTS7960 + traction motor | Nano PWM | Firmware, commanded by `steering_bridge` |
 | IMU (BNO055 or MPU6050) | Pi I²C bus 1 | `imu` node, optional — auto-detected |
 | 4× HC-SR04 | Nano D12 trigger, A0–A3 echo | `sonar` node via the serial bridge |
-| Start button | Pi GPIO17 (pin 11) | `start_button` node |
+| START/STOP button | Pi GPIO17 (pin 11) | `start_button` node |
+| MODE button | Pi GPIO27 (pin 13) | `start_button` node |
 
 The split is deliberate: the Pi does all perception and decision-making, and the Nano does
 nothing but convert two numbers (steering angle, drive percent) into PWM. That keeps the
@@ -86,6 +87,10 @@ independent watchdog that stops the motor if the Pi stops talking.
 - **`imu_node.py`** — BNO055 or MPU6050 over I²C, with hot-plug probing.
 - **`start_button_node.py`** — implements the WRO start procedure (rules 9.11/9.14):
   boot into a waiting state, first press starts the round, a later press stops it.
+  A second **MODE** button picks which round START launches — Open or Obstacle — so
+  the car needs no dashboard on the field. MODE is refused while a round is running,
+  and a button held at boot is ignored until released, so a stuck switch cannot
+  launch the car. The selected mode is published in `/start_status`.
 - **`sign_steering_node.py`** — Obstacle Challenge steering. Picks the nearest in-range
   pillar and applies the pass rule. Note it consumes **only** `/traffic_signs` and has no
   wall avoidance, so it is not used for the Open Challenge.

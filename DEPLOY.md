@@ -8,7 +8,8 @@ it is on the Pi yet — it went offline mid-session.
 | Part | Where | Notes |
 |---|---|---|
 | BNO055 (optional) | VIN→pin 17, GND→pin 9, SDA→pin 3, SCL→pin 5 | solder header first; **bridge S0 and S1 each to GND** (selects I2C at 0x28); skip the loose crystal; never bridge S0/S1 to VCC |
-| Start button | either leg→pin 11, other leg→pin 14 | no resistor, internal pull-up |
+| START/STOP button | either leg→pin 11 (GPIO17), other leg→pin 14 (GND) | no resistor, internal pull-up |
+| MODE button | either leg→pin 13 (GPIO27), other leg→pin 14 (GND) | shares the pin 14 ground with START |
 | 4× HC-SR04 | TRIG(all)→Nano D12, ECHO→Nano A0/A1/A2/A3 | 5 V rail, Nano is 5 V native so no dividers |
 
 Sonar order is **front, right, rear, left** = A0, A1, A2, A3. Wiring them in a
@@ -38,7 +39,9 @@ the drive watchdog and serial parser never block.
     # button reads
     ssh pi@100.115.88.108 "docker exec signstack bash -lc \
       'source /opt/ros/humble/setup.bash && ros2 topic echo /start_status --once'"
-    # expect: {"state": "waiting"}
+    # expect: {"state": "waiting", "mode": "open"}
+    # press MODE, echo again: mode flips to "obstacle". If it never changes,
+    # the MODE button is on the wrong line -- START is line 17, MODE is 27.
 
     # sonar streaming
     ssh pi@100.115.88.108 "docker exec signstack bash -lc \
