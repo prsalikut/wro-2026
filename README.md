@@ -47,7 +47,7 @@ shared separately. The derived, labelled dataset in `other/dataset/` is committe
 | Steering servo | Nano PWM | Firmware, commanded by `steering_bridge` |
 | BTS7960 + traction motor | Nano PWM | Firmware, commanded by `steering_bridge` |
 | IMU (BNO055 or MPU6050) | Pi I²C bus 1 | `imu` node, optional — auto-detected |
-| 4× HC-SR04 | Nano D4 trigger, A0–A3 echo | `sonar` node via the serial bridge |
+| 4× HC-SR04 | Nano D12 trigger, A0–A3 echo | `sonar` node via the serial bridge |
 | Start button | Pi GPIO17 (pin 11) | `start_button` node |
 
 The split is deliberate: the Pi does all perception and decision-making, and the Nano does

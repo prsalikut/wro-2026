@@ -9,7 +9,7 @@ it is on the Pi yet — it went offline mid-session.
 |---|---|---|
 | BNO055 (optional) | VIN→pin 17, GND→pin 9, SDA→pin 3, SCL→pin 5 | solder header first; **bridge S0 and S1 each to GND** (selects I2C at 0x28); skip the loose crystal; never bridge S0/S1 to VCC |
 | Start button | either leg→pin 11, other leg→pin 14 | no resistor, internal pull-up |
-| 4× HC-SR04 | TRIG(all)→Nano D4, ECHO→Nano A0/A1/A2/A3 | 5 V rail, Nano is 5 V native so no dividers |
+| 4× HC-SR04 | TRIG(all)→Nano D12, ECHO→Nano A0/A1/A2/A3 | 5 V rail, Nano is 5 V native so no dividers |
 
 Sonar order is **front, right, rear, left** = A0, A1, A2, A3. Wiring them in a
 different order silently swaps the readings.
