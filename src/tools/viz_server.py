@@ -26,6 +26,7 @@ import glob
 import json
 import math
 import os
+import subprocess
 import shutil
 import socket
 import threading
@@ -72,6 +73,9 @@ S = {
     "trim": 0.0,
 }
 LIVE = {
+    "yaw": None, "yaw_time": 0.0,       # /imu/yaw, for the liveness panel
+    "open": None, "open_time": 0.0,       # /open_status, the open-round driver
+    "lane": None, "lane_time": 0.0,       # /vision/lane, the camera's lane view
     "cam": None, "raw": None, "scan": None, "det": None,
     "steer": 0.0, "drive": 0.0, "drive_msg": None,
     "bridge": None, "bridge_time": None,
@@ -86,8 +90,18 @@ REPLY_SEQ = [0]
 MISSION = deque(maxlen=100)
 
 RC_STEER_LIMIT = 25.0
-RC_DRIVE_CEIL = 70.0
-RC = {"active": False, "max_pct": 55.0, "steer": 0.0, "drive": 0.0, "last": 0.0}
+RC_DRIVE_CEIL = 100.0
+RC = {"active": False, "max_pct": 85.0, "steer": 0.0, "drive": 0.0, "last": 0.0,
+      "kick_until": 0.0, "was_moving": False}
+
+# This drivetrain will not start from rest at a duty it will happily keep
+# running at: held just under the break-away point it stalls and whines, which
+# is the motor drawing current and not turning. So a throttle command that
+# starts from rest gets a short burst of full duty first, exactly as the
+# autonomous driver does, and then falls back to whatever the operator asked
+# for. Without it the useful part of the throttle range is unreachable.
+RC_KICK_PCT = 100.0
+RC_KICK_S = 0.28
 
 
 def now():
@@ -235,7 +249,29 @@ def stack_poller():
         time.sleep(2)
 
 
+def in_container():
+    """True when this process is already inside the stack container."""
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup") as fh:
+            return "docker" in fh.read()
+    except Exception:
+        return False
+
+
+IN_CONTAINER = in_container()
+
+
 def exec_detached(cmd):
+    if IN_CONTAINER:
+        try:
+            subprocess.Popen(["bash", "-lc", cmd],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
     st, body = docker_api("POST", "/containers/{}/exec".format(STACK),
                           {"Cmd": ["bash", "-c", cmd], "AttachStdout": False,
                            "AttachStderr": False, "Detach": True})
@@ -248,6 +284,14 @@ def exec_detached(cmd):
 
 def exec_capture(cmd, timeout=25):
     """Run a command in the stack container and return (ok, combined_output)."""
+    if IN_CONTAINER:
+        try:
+            out = subprocess.run(["bash", "-lc", cmd], timeout=timeout,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+            return out.returncode == 0, out.stdout.decode("utf-8", "replace")
+        except Exception as exc:
+            return False, str(exc)
     st, body = docker_api("POST", "/containers/{}/exec".format(STACK),
                           {"Cmd": ["bash", "-c", cmd], "AttachStdout": True,
                            "AttachStderr": True})
@@ -307,6 +351,162 @@ def autonomy_stop():
     return exec_detached(AUTONOMY_KILL)
 
 
+OPEN_KILL = ("for d in /proc/[0-9]*; do if tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null"
+             " | grep -q open_round; then kill \"${d#/proc/}\"; fi; done")
+
+
+def open_running():
+    ok, out = exec_capture(
+        "for d in /proc/[0-9]*; do tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null"
+        " | grep -q open_round && echo RUNNING && break; done; true", timeout=8)
+    return ok and "RUNNING" in out
+
+
+def open_start(drive_pct=None):
+    """Start the open-round driver from the dashboard.
+
+    On the field the START button launches it (rules 9.11/9.14) and the node
+    waits for that button.  Started from here there is no button press to wait
+    for, so require_start is turned off explicitly -- and drive_pct 0 gives a
+    steering-only dry run, which is the safe way to watch it think.
+    """
+    exec_detached(OPEN_KILL)
+    time.sleep(0.6)
+    overrides = " -p require_start:=false"
+    if drive_pct is not None:
+        overrides += " -p drive_pct:={}".format(float(drive_pct))
+    cmd = (ROS_PREFIX + "nohup ros2 run sign_detector open_round --ros-args "
+           "-r __node:=open_round --params-file "
+           "/ros2_ws/install/sign_detector/share/sign_detector/config/params.yaml"
+           + overrides + " >/tmp/open_round.log 2>&1 &")
+    return exec_detached(cmd)
+
+
+def open_stop():
+    return exec_detached(OPEN_KILL)
+
+
+# --- drive recording -------------------------------------------------------
+# One recorder at a time, started and stopped from the RC page, each round
+# written to its own file. Separate files matter: the point is to compare
+# clockwise against counter-clockwise and one lap against another, which a
+# single continuous log makes hard.
+REC = {"proc": None, "path": None, "label": None, "t0": None}
+REC_DIR = "/tmp/drives"
+
+
+def record_running():
+    p = REC["proc"]
+    return p is not None and p.poll() is None
+
+
+def record_start(label):
+    if record_running():
+        return False, "already recording"
+    os.makedirs(REC_DIR, exist_ok=True)
+    safe = "".join(c for c in (label or "run") if c.isalnum() or c in "-_")[:32]
+    path = os.path.join(REC_DIR, "%s_%s.jsonl" % (
+        time.strftime("%H%M%S"), safe or "run"))
+    cmd = (ROS_PREFIX + "exec python3 /ros2_ws/src/sign_detector/tools/"
+           "record_drive.py --out '%s'" % path)
+    try:
+        REC["proc"] = subprocess.Popen(["bash", "-lc", cmd],
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return False, str(exc)
+    REC["path"], REC["label"], REC["t0"] = path, safe, now()
+    log_event("record", "start %s -> %s" % (safe, path))
+    return True, path
+
+
+def record_stop():
+    if not record_running():
+        return False, "not recording"
+    try:
+        REC["proc"].terminate()
+        for _ in range(20):
+            if REC["proc"].poll() is not None:
+                break
+            time.sleep(0.05)
+        if REC["proc"].poll() is None:
+            REC["proc"].kill()
+    except Exception:
+        pass
+    path = REC["path"]
+    rows = 0
+    try:
+        with open(path) as fh:
+            rows = sum(1 for _ in fh)
+    except Exception:
+        pass
+    log_event("record", "stop %s (%d rows)" % (REC["label"], rows))
+    REC["proc"] = None
+    return True, {"path": path, "rows": rows}
+
+
+def sensor_health():
+    """Which sensors are actually live right now, for the record panel."""
+    t = now()
+    lane = LIVE.get("lane") if (LIVE.get("lane_time")
+                                and t - LIVE["lane_time"] < 3) else None
+    return {
+        "camera": bool(LIVE.get("cam") and t - LIVE["cam"] < 2),
+        "lidar": bool(LIVE.get("scan") and t - LIVE["scan"] < 2),
+        "vision": bool(lane and lane.get("ok")),
+        "imu": bool(LIVE.get("yaw_time") and t - LIVE["yaw_time"] < 2),
+    }
+
+
+def record_status():
+    rows = 0
+    if REC["path"]:
+        try:
+            with open(REC["path"]) as fh:
+                rows = sum(1 for _ in fh)
+        except Exception:
+            rows = 0
+    return {"recording": record_running(), "label": REC["label"],
+            "path": REC["path"], "rows": rows,
+            "seconds": round(now() - REC["t0"], 1) if (REC["t0"] and
+                                                       record_running()) else 0}
+
+
+def record_delete(name):
+    """Delete one recording. Bad data is worse than no data: a round where the
+    car was rescued, or the battery sagged, teaches the wrong lesson, and it is
+    easier to bin it at the time than to spot it in analysis afterwards."""
+    if not name or "/" in name or not name.endswith(".jsonl"):
+        return False, "bad name"
+    full = os.path.join(REC_DIR, name)
+    if record_running() and REC.get("path") == full:
+        return False, "that one is still recording"
+    try:
+        os.remove(full)
+    except OSError as exc:
+        return False, str(exc)
+    log_event("record", "deleted %s" % name)
+    return True, "deleted"
+
+
+def record_list():
+    out = []
+    try:
+        for f in sorted(os.listdir(REC_DIR)):
+            if not f.endswith(".jsonl"):
+                continue
+            full = os.path.join(REC_DIR, f)
+            try:
+                with open(full) as fh:
+                    n = sum(1 for _ in fh)
+            except Exception:
+                n = 0
+            out.append({"name": f, "rows": n})
+    except Exception:
+        pass
+    return out
+
+
 def pi_health():
     temp = load = None
     undervolt = None
@@ -356,6 +556,9 @@ class VizNode(Node):
         self.create_subscription(Float32, "/drive_cmd", self._drive, 10)
         self.create_subscription(String, "/arduino_reply", self._reply, 10)
         self.create_subscription(String, "/bridge_status", self._bstat, 10)
+        self.create_subscription(String, "/open_status", self._ostat, 10)
+        self.create_subscription(String, "/vision/lane", self._lane, 10)
+        self.create_subscription(Float32, "/imu/yaw", self._imu_yaw, 10)
         self.pub_cmd = self.create_publisher(String, "/arduino_cmd", 10)
         self.pub_steer = self.create_publisher(Float32, "steering_cmd", 10)
         self.pub_drive = self.create_publisher(Float32, "drive_cmd", 10)
@@ -375,7 +578,10 @@ class VizNode(Node):
         if not RC["active"]:
             return
         stale = now() - RC["last"] > 0.5
-        self.rc_publish(RC["steer"], 0.0 if stale else RC["drive"])
+        drive = 0.0 if stale else RC["drive"]
+        if drive != 0.0 and now() < RC["kick_until"]:
+            drive = math.copysign(RC_KICK_PCT, drive)
+        self.rc_publish(RC["steer"], drive)
 
     def _img(self, m):
         self.img = self.br.imgmsg_to_cv2(m, "bgr8")
@@ -422,6 +628,24 @@ class VizNode(Node):
         with LOCK:
             REPLY_SEQ[0] += 1
             REPLIES.append((REPLY_SEQ[0], m.data, now()))
+
+    def _ostat(self, m):
+        try:
+            LIVE["open"] = json.loads(m.data)
+            LIVE["open_time"] = now()
+        except ValueError:
+            pass
+
+    def _lane(self, m):
+        try:
+            LIVE["lane"] = json.loads(m.data)
+            LIVE["lane_time"] = now()
+        except ValueError:
+            pass
+
+    def _imu_yaw(self, m):
+        LIVE["yaw"] = float(m.data)
+        LIVE["yaw_time"] = now()
 
     def _bstat(self, m):
         try:
@@ -685,6 +909,7 @@ def act_estop():
     r1 = node.send_raw("M 0", wait=1.5)
     r2 = node.send_raw("C", wait=1.5)
     autonomy_stop()
+    open_stop()
     acked = r1 is not None and "OK" in str(r1)
     fallback = None
     if not acked:
@@ -700,7 +925,12 @@ def rc_engage():
     teleop topics, close any open manual window (so the bridge forwards our
     steering_cmd/drive_cmd), and ARM the 20 Hz republish tick. The robot stays
     still (drive 0) until the operator holds the deadman AND pushes throttle."""
-    autonomy_stop()
+    for step in (autonomy_stop, open_stop):
+        try:
+            step()
+        except Exception as exc:
+            log_event("rc", "engage: %s failed (%s), continuing"
+                      % (step.__name__, exc))
     node = NODE["n"]
     # Arm the firmware drive deadman: RC streams M at 20 Hz, so 400 ms is a wide
     # margin, and it closes the hole where the bridge's manual keepalive PINGs
@@ -708,8 +938,11 @@ def rc_engage():
     # MUST precede RESUME: send_raw opens a 30 s manual window that suspends
     # steering_cmd/drive_cmd forwarding, and RC drives through those topics.
     # RESUME closes that window again.
-    node.send_raw("DWD 400", wait=1.0)
-    node.send_raw("RESUME", wait=1.0)
+    for cmd in ("DWD 400", "RESUME"):
+        try:
+            node.send_raw(cmd, wait=1.0)
+        except Exception as exc:
+            log_event("rc", "engage: %s failed (%s), continuing" % (cmd, exc))
     with LOCK:
         RC["active"] = True
         RC["steer"] = 0.0
@@ -721,8 +954,7 @@ def rc_engage():
 
 
 def rc_command(steer, drive, deadman, max_pct=None):
-    """One teleop sample from the browser. Clamps hard; DRIVE is forced to 0
-    unless the deadman is held. Does not arm RC (only rc_engage does, so an
+    """One teleop sample from the browser. Clamps hard. Does not arm RC (only rc_engage does, so an
     E-STOP stays latched); the 20 Hz _rc_tick republishes RC[] so the browser's
     jittery POST rate cannot open gaps in the command stream."""
     try:
@@ -739,7 +971,20 @@ def rc_command(steer, drive, deadman, max_pct=None):
                 pass
         cap = RC["max_pct"]
         RC["steer"] = max(-RC_STEER_LIMIT, min(RC_STEER_LIMIT, steer))
-        RC["drive"] = max(-cap, min(cap, drive)) if deadman else 0.0
+        # No deadman gate: on a keyboard, letting go of W already commands
+        # zero, and _rc_tick zeroes the drive if the browser goes quiet for
+        # 0.5 s, with the firmware's own DWD watchdog behind that. A separate
+        # held key added a failure mode (a dropped modifier) without adding
+        # safety.
+        want = max(-cap, min(cap, drive))
+        moving = abs(want) > 1.0
+        if moving and not RC["was_moving"]:
+            # Leaving rest: kick.
+            RC["kick_until"] = now() + RC_KICK_S
+        if not moving:
+            RC["kick_until"] = 0.0
+        RC["was_moving"] = moving
+        RC["drive"] = want
         RC["last"] = now()
         armed, out_s, out_d = RC["active"], RC["steer"], RC["drive"]
     return {"ok": True, "active": armed, "steer": out_s, "drive": out_d,
@@ -994,6 +1239,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/estop":
             self._json(act_estop()); return
+        if p == "/api/record/start":
+            ok, info = record_start(str(body.get("label", "run")))
+            self._json({"ok": ok, "info": info, "status": record_status()})
+            return
+        if p == "/api/record/delete":
+            ok, info = record_delete(str(body.get("name", "")))
+            self._json({"ok": ok, "info": info, "runs": record_list()})
+            return
+        if p == "/api/record/stop":
+            ok, info = record_stop()
+            self._json({"ok": ok, "info": info, "status": record_status()})
+            return
         if p == "/api/rc/engage":
             self._json(rc_engage()); return
         if p == "/api/rc/release":
@@ -1053,6 +1310,25 @@ class Handler(BaseHTTPRequestHandler):
                 cruise, "RUNNING" if alive else "NOT DETECTED (check logs)"))
             self._json({"ok": ok and alive, "running": alive,
                         "cruise": cruise}); return
+        if p == "/api/open/start":
+            if not caps["autonomy"]:
+                self._json({"ok": False,
+                            "err": "blocked in {} mode".format(mode)}, 403)
+                return
+            try:
+                pct = float(body.get("drive_pct", 45.0))
+            except (TypeError, ValueError):
+                pct = 45.0
+            ok = open_start(pct)
+            time.sleep(2.0)
+            alive = open_running()
+            log_event("open", "open round start drive={} -> {}".format(pct, alive))
+            self._json({"ok": ok, "running": alive, "drive_pct": pct})
+            return
+        if p == "/api/open/stop":
+            self._json({"ok": open_stop()})
+            log_event("open", "open round stop")
+            return
         if p == "/api/autonomy/stop":
             self._json({"ok": autonomy_stop()}); log_event("autonomy", "stop"); return
         if p == "/api/raw":
@@ -1146,6 +1422,10 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": False, "err": "unknown endpoint"}, 404)
 
     def do_GET(self):
+        if self.path.startswith("/api/record"):
+            self._json({"status": record_status(), "runs": record_list(),
+                        "sensors": sensor_health()})
+            return
         if self.path.startswith("/api/status"):
             t = now()
             temp, load, undervolt, disk = pi_health()
@@ -1155,6 +1435,10 @@ class Handler(BaseHTTPRequestHandler):
                 "mode": S["mode"], "caps": MODE_CAPS[S["mode"]],
                 "stack": stack_running(),
                 "autonomy": _STACK_CACHE.get("autonomy"),
+                "open": LIVE["open"] if (LIVE["open_time"]
+                                         and t - LIVE["open_time"] < 3) else None,
+                "lane": LIVE["lane"] if (LIVE["lane_time"]
+                                         and t - LIVE["lane_time"] < 3) else None,
                 "epoch": PANEL_EPOCH,
                 "cam": {"age": _age(LIVE["cam"]), "fps": round(rate_of("cam"), 1)},
                 "scan": {"age": _age(LIVE["scan"]), "hz": round(rate_of("scan"), 1)},
@@ -1230,8 +1514,14 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
         body = (RC_HTML if self.path.startswith("/rc") else PANEL_HTML).encode()
+        # No caching: the console changes often, and a browser holding a stale
+        # copy silently loses whatever controls were added since -- which looks
+        # exactly like a broken button.
+        self._nocache = True
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1329,6 +1619,14 @@ PANEL_HTML = r"""<!doctype html>
     <button onclick="post('/api/autonomy/stop')">■ autonomy off</button>
     cruise <input id="cruise" type="number" value="55" min="40" max="70">%
    </div>
+   <div class="row" id="openrow">
+    <button onclick="startOpen(0)">▶ OPEN dry run (servo only)</button>
+    <button onclick="startOpen()">▶ OPEN round</button>
+    <button onclick="post('/api/open/stop')">■ open off</button>
+    drive <input id="openpct" type="number" value="45" min="0" max="70">%
+   </div>
+   <div class="row dim" id="openstat">open round: idle</div>
+   <div class="row dim" id="lanestat">camera lane: no data</div>
    <div class="row">
     <button onclick="showLog('autonomy')">autonomy log</button>
     <button onclick="showLog('stack')">stack log</button>
@@ -1442,6 +1740,24 @@ async function raw(c){if(!c)return;const j=await post('/api/raw',{cmd:c});
  if(j.reply)toast(j.reply);}
 function motor(dir){post('/api/motor',
  {duty:dir*parseFloat($('duty').value),dur:parseFloat($('dur').value)});}
+function startOpen(pct){const p=pct!==undefined?pct:parseFloat($('openpct').value);
+ post('/api/open/start',{drive_pct:p}).then(j=>{
+  if(j.running)toast(p===0?'OPEN dry run live (servo only)':'OPEN round RUNNING at '+j.drive_pct+'%');
+  else if(j.ok===false)toast('\u2717 open round did not come up \u2014 check the stack log');});}
+function fmtOpen(o){if(!o)return 'open round: idle';
+ var bits=[o.state,'corner '+o.turns+'/12'];
+ if(o.direction)bits.push(o.direction);
+ if(o.tight)bits.push('tight');
+ if(o.recoveries)bits.push(o.recoveries+' recover');
+ bits.push('L'+(o.left==null?'-':o.left)+' R'+(o.right==null?'-':o.right)+' F'+(o.front==null?'-':o.front));
+ if(o.reason)bits.push(o.reason);
+ var h=o.health&&Object.keys(o.health).length?Object.keys(o.health).map(function(k){return k+': '+o.health[k];}):[];
+ return 'open round: '+bits.join(' \u00b7 ')+(h.length?'  \u26a0 '+h.join('; '):'');}
+function fmtLane(l){if(!l)return 'camera lane: no data';
+ if(!l.ok)return 'camera lane: NOT OK \u2014 '+(l.reason||'')+' (floor '+Math.round(100*(l.floor_frac||0))+'%)';
+ return 'camera lane: L='+(l.left==null?'-':l.left)+' R='+(l.right==null?'-':l.right)
+   +' F='+(l.front==null?'-':l.front)+' heading='+(l.heading==null?'-':l.heading)
+   +' lines='+(Object.keys(l.lines||{}).join(',')||'none');}
 function startAuto(cruise){const c=cruise!==undefined?cruise:parseFloat($('cruise').value);
  post('/api/autonomy/start',{cruise:c}).then(j=>{
   if(j.running)toast(c===0?'DRY RUN live (servo only)':'autonomy RUNNING at '+j.cruise+'%');
@@ -1483,6 +1799,9 @@ async function poll(){
   $('sec_calib').classList.toggle('hide',MODE==='desktop');
   $('sec_final').classList.toggle('hide',MODE!=='final');
   $('autonomyrow').classList.toggle('hide',!s.caps.autonomy);
+  $('openrow').classList.toggle('hide',!s.caps.autonomy);
+  $('openstat').textContent=fmtOpen(s.open);
+  $('lanestat').textContent=fmtLane(s.lane);
   $('duty').max=s.caps.duty;$('dur').max=s.caps.dur;
   chip('c_stack',s.stack?'ON':'OFF',s.stack?'ok':'bad');
   chip('c_auto',s.autonomy===true?'RUN':(s.autonomy===false?'off':'?'),
@@ -1616,7 +1935,16 @@ RC_HTML = r"""<!doctype html>
     <div id="driven" class="num" style="font-size:15px">0%</div>
    </div>
   </div>
-  <div class="row"><span><span id="deadlamp" class="lamp"></span><span id="deadtxt" class="dim">deadman: release</span></span></div>
+  <div class="row"><span><span id="deadlamp" class="lamp"></span><span id="deadtxt" class="dim">idle</span></span></div>
+  <div class="row dim">W/S drive &middot; A/D steer &middot; hold to go, release to stop &middot; Space = E-STOP</div>
+  <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:6px">
+   <button id="recCW"  onclick="recStart('cw')">&#9679; record CW</button>
+   <button id="recCCW" onclick="recStart('ccw')">&#9679; record CCW</button>
+   <button id="recStop" onclick="recStop()">&#9632; stop recording</button>
+  </div>
+  <div class="row dim" id="recstat">not recording</div>
+  <div class="row dim" id="recsens">sensors: ?</div>
+  <div class="row" id="reclist" style="flex-direction:column;align-items:stretch;gap:4px"></div>
  </div>
 
  <div>
@@ -1625,7 +1953,10 @@ RC_HTML = r"""<!doctype html>
    <div class="dim" style="line-height:1.7">
     0. Click <b>"↻ scan"</b> then press any controller button to connect.<br>
     1. Press <b>ENGAGE</b> (enter key) — stops autonomy, takes direct control.<br>
-    2. <b>Hold the deadman</b> (gamepad <b>RB</b> / keyboard <kbd>Shift</kbd>) — motor only runs while held.<br>
+    2. <b>Drive:</b> <kbd>W</kbd> forward, <kbd>S</kbd> back, <kbd>A</kbd>/<kbd>D</kbd> steer.
+       Release to stop. No deadman to hold.<br>
+    &nbsp;&nbsp;&nbsp;Duty starts at 78% because this motor does not turn below about 60%.<br>
+    &nbsp;&nbsp;&nbsp;<kbd>Space</kbd> = E-STOP. Clicking away from this page also stops the car.<br>
     3. Steer: <b>left stick</b> / <kbd>A</kbd><kbd>D</kbd> &nbsp; Throttle: <b>RT</b>/<b>LT</b> triggers / <kbd>W</kbd><kbd>S</kbd>.<br>
     <kbd>Esc</kbd> = disarm &nbsp; <kbd>Space</kbd> = E-STOP.<br>
     <span style="color:#ffb64d">Steam Deck:</span> run <code>flatpak override --user --device=all org.mozilla.firefox</code> once.
@@ -1634,9 +1965,9 @@ RC_HTML = r"""<!doctype html>
   <div class="card">
    <h3>controls</h3>
    <div class="row"><label>max speed</label>
-    <input id="max" type="range" min="0" max="70" value="55"
+    <input id="max" type="range" min="60" max="100" value="85"
      oninput="cfg.max=+this.value;document.getElementById('maxn').textContent=this.value+'%'">
-    <span id="maxn">55%</span></div>
+    <span id="maxn">85%</span></div>
    <div class="row"><label>steer sens</label>
     <input id="sens" type="range" min="0.4" max="1" step="0.05" value="1"
      oninput="cfg.sens=+this.value;document.getElementById('sensn').textContent=this.value">
@@ -1665,7 +1996,9 @@ RC_HTML = r"""<!doctype html>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let cfg={thr:'trig',steerAxis:0,dead:5,invert:false,max:55,sens:1.0,expo:0.22};
+// max starts at 78: this car's motor does not turn at all below about
+// 60% duty, so anything under that is a dead control.
+let cfg={thr:'trig',steerAxis:0,dead:5,invert:false,max:85,sens:1.0,expo:0.22};
 let armed=false, estopped=false, gpIdx=null, key={}, last={steer:0,drive:0,deadman:false};
 let gpPollId=null, gpEver=false;
 function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;
@@ -1697,11 +2030,11 @@ function readControls(){
   steer=expo(dz(p.axes[cfg.steerAxis]||0),cfg.expo)*cfg.sens*(cfg.invert?-1:1);
   if(cfg.thr==='trig'){var t=readTriggers(p);thr=t.rt-t.lt;}
   else thr=-dz(p.axes[3]||0,0.12);
-  dead=!!((p.buttons[cfg.dead]||{}).pressed);
+  dead=true;   // no deadman on the pad either
  } else {
   steer=((key['arrowright']||key['d']?1:0)-(key['arrowleft']||key['a']?1:0))*cfg.sens*(cfg.invert?-1:1);
   thr=(key['arrowup']||key['w']?1:0)-(key['arrowdown']||key['s']?1:0);
-  dead=!!(key['shift']||key['j']);
+  dead=true;   // no deadman: releasing the key is the stop
  }
  return {steer:Math.max(-25,Math.min(25,steer*25)),
          drive:Math.max(-cfg.max,Math.min(cfg.max,thr*cfg.max)),
@@ -1714,7 +2047,7 @@ async function sendLoop(){
  const c=last;
  try{
   const r=await fetch('/api/rc',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({steer:c.steer,drive:c.deadman?c.drive:0,deadman:c.deadman,max_pct:cfg.max})});
+   body:JSON.stringify({steer:c.steer,drive:c.drive,deadman:true,max_pct:cfg.max})});
   await r.json();
  }catch(e){/* transient */}
 }
@@ -1735,7 +2068,7 @@ function frame(){
  $('driven').textContent=dv.toFixed(0)+'%';
  const held=last.deadman;
  $('deadlamp').className='lamp'+(held?' on':'');
- $('deadtxt').textContent=held?'deadman: HELD (drive live)':'deadman: release';
+ $('deadtxt').textContent=held?'drive live':'idle';
  $('deadtxt').className=held?'ok':'dim';
  setBanner();
  drawRaw();
@@ -1756,6 +2089,72 @@ function drawRaw(){const p=pad();if(!p){$('raw').textContent='no gamepad detecte
 requestAnimationFrame(frame);
 
 // ---- engage / disarm / estop ----
+
+// ---- round recording -------------------------------------------------
+async function recStart(label){
+ try{
+  const r=await fetch('/api/record/start',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({label:label})});
+  const j=await r.json();
+  if(j.ok){toast('recording '+label.toUpperCase());}
+  else{toast('could not start: '+j.info);}
+ }catch(e){toast('record start failed: '+e);}
+ recPoll();
+}
+async function recStop(){
+ try{
+  const j=await(await fetch('/api/record/stop',{method:'POST'})).json();
+  toast(j.ok?('saved '+(j.info&&j.info.rows||0)+' rows'):String(j.info));
+ }catch(e){toast('record stop failed: '+e);}
+ recPoll();
+}
+async function recDel(name){
+ try{
+  const j=await(await fetch('/api/record/delete',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({name:name})})).json();
+  toast(j.ok?('deleted '+name):('could not delete: '+j.info));
+ }catch(e){toast('delete failed: '+e);}
+ recPoll();
+}
+async function recPoll(){
+ try{
+  const j=await(await fetch('/api/record')).json();
+  const s=j.status||{};
+  const el=$('recstat');
+  if(el){
+   el.textContent=s.recording
+    ? ('RECORDING '+String(s.label||'').toUpperCase()+' — '+s.rows+' rows, '+s.seconds+' s')
+    : 'not recording';
+   el.style.color=s.recording?'#ff6b6b':'';
+  }
+  const sens=j.sensors||{};
+  const se=$('recsens');
+  if(se){
+   se.textContent='sensors: '+Object.keys(sens).map(function(k){
+    return k+'='+(sens[k]===null?'?':(sens[k]?'ok':'DOWN'));}).join('  ');
+   se.style.color=Object.keys(sens).some(function(k){return sens[k]===false;})?'#ffb64d':'';
+  }
+  const box=$('reclist');
+  if(box){
+   box.innerHTML='';
+   (j.runs||[]).forEach(function(r){
+    const d=document.createElement('div');
+    d.className='row'; d.style.justifyContent='space-between';
+    const sp=document.createElement('span'); sp.className='dim';
+    sp.textContent=r.name+'  ('+r.rows+' rows)';
+    const b=document.createElement('button');
+    b.textContent='delete'; b.style.padding='2px 10px';
+    b.onclick=function(){
+     if(confirm('Delete '+r.name+'? It will not be used for tuning.'))recDel(r.name);};
+    d.appendChild(sp); d.appendChild(b); box.appendChild(d);});
+  }
+ }catch(e){}
+}
+setInterval(recPoll,1500);
+recPoll();
+
 async function engage(){try{const j=await(await fetch('/api/rc/engage',{method:'POST'})).json();
  armed=true;estopped=false;toast('RC engaged — autonomy stopped');}catch(e){toast('✗ engage failed');}updateBtns();}
 async function disarm(){armed=false;updateBtns();try{await fetch('/api/rc/release',{method:'POST'});}catch(e){}}
@@ -1774,6 +2173,12 @@ addEventListener('keydown',e=>{var k=e.key.toLowerCase();
  key[k]=true;
  if(['arrowup','arrowdown','arrowleft','arrowright'].includes(k))e.preventDefault();});
 addEventListener('keyup',e=>{key[e.key.toLowerCase()]=false;});
+// Anything that takes focus away from this page releases every key. Without
+// this, cmd-tab on a Mac leaves W held down and the car drives off.
+function releaseAll(){for(var k in key)key[k]=false;}
+addEventListener('blur',releaseAll);
+addEventListener('visibilitychange',function(){if(document.hidden)releaseAll();});
+addEventListener('mouseleave',releaseAll);
 
 // ---- safety: stop on tab hide / close ----
 addEventListener('beforeunload',()=>{try{navigator.sendBeacon('/api/rc/release');}catch(e){}});

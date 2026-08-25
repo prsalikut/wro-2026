@@ -26,6 +26,7 @@ setup(
             'steering_bridge = sign_detector.steering_node:main',
             'sign_steering = sign_detector.sign_steering_node:main',
             'open_round = sign_detector.open_round_node:main',
+            'wall_vision = sign_detector.vision_node:main',
             'imu = sign_detector.imu_node:main',
             'line_detector = sign_detector.line_detector_node:main',
             'start_button = sign_detector.start_button_node:main',

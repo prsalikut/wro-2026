@@ -13,6 +13,7 @@ component passes, so it can gate a launch script."""
 
 import argparse
 import collections
+import json
 import math
 import statistics as st
 import sys
@@ -25,6 +26,7 @@ from sensor_msgs.msg import Image, Imu, LaserScan, Range
 from std_msgs.msg import Float32, String
 
 SONARS = ("front", "right", "rear", "left")
+VISION = ("left", "right", "front")
 
 # name -> (topic, type, qos, required)
 CHECKS = [
@@ -34,7 +36,12 @@ CHECKS = [
     ("imu",      "imu/data",       Imu,       qos_profile_sensor_data, False),
     ("imu_yaw",  "imu/yaw",        Float32,   10,                      False),
     ("buttons",  "start_status",   String,    10,                      True),
+    # The open round drives on the camera first, so a silent wall_vision is a
+    # failure, not a nicety.
+    ("vision",   "vision/lane",    String,    10,                      True),
 ]
+for _v in VISION:
+    CHECKS.append(("vis_" + _v, "vision/" + _v, Range, 10, False))
 for _s in SONARS:
     CHECKS.append(("sonar_" + _s, "sonar/" + _s, Range, 10, True))
 
@@ -69,6 +76,26 @@ class Check(Node):
                 q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w))
         elif isinstance(msg, String):
             self.text[name] = msg.data
+
+
+def _vision_note(raw):
+    """Summarise the camera's own view of the lane."""
+    if not raw:
+        return "no data"
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return "unparsable"
+    if not d.get("ok"):
+        return "NOT OK: %s (floor %.0f%%)" % (
+            d.get("reason"), 100.0 * (d.get("floor_frac") or 0.0))
+    walls = [k for k in ("left", "right") if d.get(k) is not None]
+    if not walls:
+        return "no walls fitted -- front %s, floor %.0f%%" % (
+            d.get("front"), 100.0 * (d.get("floor_frac") or 0.0))
+    return "L=%s R=%s F=%s heading=%s lines=%s" % (
+        d.get("left"), d.get("right"), d.get("front"), d.get("heading"),
+        sorted(d.get("lines") or {}) or "none")
 
 
 def rate(n, secs):
@@ -125,6 +152,13 @@ def main():
         elif name == "imu_yaw":
             v = node.vals[name]
             note = "yaw %.1f..%.1f deg" % (min(v), max(v))
+        elif name == "vision":
+            note = _vision_note(node.text.get("vision"))
+            if note.startswith("no walls"):
+                warnings.append(name)
+        elif name.startswith("vis_"):
+            v = node.vals[name]
+            note = "%.2f-%.2f m" % (min(v), max(v))
         elif name in node.text:
             note = node.text[name]
 
@@ -134,6 +168,14 @@ def main():
             name, n, hz, "FAIL  " if bad else "", note))
 
     print()
+    if node.count["vision"] == 0:
+        print("wall_vision is not publishing. The open round can still run on")
+        print("  lidar and sonar alone, but that is the configuration that has")
+        print("  already failed on this car -- check the wall_vision node.")
+    else:
+        print("Camera lane view:", _vision_note(node.text.get("vision")))
+        print("  Cross-check it against the ranges with:")
+        print("    python3 tools/vision_calib.py --check")
     if node.count["imu"] == 0:
         print("IMU absent: heading hold is off, open_round falls back to")
         print("  derivative damping from the ranges. Not fatal.")

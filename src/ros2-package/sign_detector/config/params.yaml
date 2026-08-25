@@ -19,8 +19,10 @@ sign_detector:
 
     lidar_dx: -0.195
     angle_sign: 1.0
-    # re-measured 2026-08-22 after the lidar re-rig; was -93.7
-    angle_offset_deg: 170.0
+    # Re-solved 2026-08-25 against the ultrasonics (tools/collect_cal.py);
+    # was 170.0, and before that -93.7.  open_round uses the same value: both
+    # nodes have to agree on where forward is.
+    angle_offset_deg: 176.0
     search_window_deg: 10.0
     match_tol_m: 0.25
     max_range_m: 2.0
@@ -35,7 +37,15 @@ steering_bridge:
     port: "auto"
     baud: 115200
 
-    steer_dir: 1.0
+    # Both of these are measured, not assumed.
+    # steer_dir -1.0: across 4721 samples of human driving, a POSITIVE steering
+    # command produced -29 deg/s of yaw (anticlockwise) and a negative one
+    # +19 deg/s. The servo is mounted so that positive steers left, which is
+    # why "orange line -> turn RIGHT" drove the car into the left wall.
+    steer_dir: -1.0
+    # drive_dir -1.0: a positive drive command moved the car BACKWARDS -- the
+    # front lidar range grew (tools/inch_test.py).
+    drive_dir: -1.0
     max_deg: 25.0
     rate_limit_dps: 0.0
     cmd_timeout_s: 1.0
@@ -64,3 +74,192 @@ start_button:
 # open_round and imu run on their in-code defaults, which hold the tuned and
 # track-verified values. Add overrides here only deliberately; a stale copy of
 # this section once reverted a calibrated lidar offset.
+
+# --- Open Challenge --------------------------------------------------------
+# Camera lane perception.  The mounting numbers are the ones that must be
+# right: everything the node reports is a distance derived from where the wall
+# meets the mat, so an error in height or pitch is an error in every range.
+# Measure them with tools/vision_calib.py, do not estimate them.
+wall_vision:
+  ros__parameters:
+    # Measured on the car 2026-08-25: lens 130 mm above the mat (ruler), and
+    # the pitch solved from a wall the lidar put at 2.348 m while the camera
+    # saw its base on image row 149 of 480.  Re-run tools/vision_calib.py
+    # after ANY change to the camera mount -- every range below scales with
+    # these two numbers.
+    cam_height_m: 0.130      # lens centre above the mat
+    cam_pitch_deg: 12.6      # tilt below horizontal, positive = looking down
+    cam_x_m: 0.05            # lens ahead of the rear axle
+    hfov_deg: 60.0           # horizontal field of view of THIS lens
+    max_range_m: 2.2         # beyond this one pixel row is worth over 5 cm
+
+    process_hz: 25.0
+    publish_debug: true
+    debug_hz: 4.0
+
+    # Segmentation.  The floor colour is learned every frame, so these are
+    # ratios rather than absolute levels and should survive a change of venue.
+    dark_ratio: 0.62         # this fraction of local floor brightness = wall
+    chroma_min: 20.0         # LAB distance that counts as "coloured"
+    illum_fit: true          # compensate vignetting and lighting gradients
+    paint_is_floor: true     # the blue corner line is dark but is not a wall
+    # No parking lot exists in an open round, and magenta was detected in 65
+    # frames across the four recorded rounds -- every one a false positive.
+    # Treating those as obstacles would brake the car for nothing.
+    block_magenta: false
+
+open_round:
+  ros__parameters:
+    # Lidar mounting, solved 2026-08-25 from 790 samples while the car was
+    # turned through 298 degrees by hand, matching the scan against the four
+    # ultrasonics at their known mounting bearings (tools/collect_cal.py).
+    # Median disagreement 0.180 m at this value against 0.578 m at the old
+    # 170.0, and the search landscape is sharp rather than flat, so this is
+    # measured rather than guessed.  The sign came out +1: the lidar is NOT
+    # inverted.
+    angle_offset_deg: 176.0
+    angle_sign: 1.0
+
+    require_start: true      # rules 9.11/9.14 -- wait for the START button
+    tick_hz: 50.0            # control loop rate
+    drive_pct: 70.0          # 0 turns the round into a steering-only dry run
+
+    # This drivetrain does not move at all below about 60% duty -- measured on
+    # the car, and double the 30% that was previously recorded.  So there is no
+    # slow speed available: anything that moves, moves fast.  The round is
+    # driven in pulses instead, short bursts above stiction separated by
+    # coasting, which is the only way to get a controllable average speed out
+    # of it.
+    stiction_pct: 60.0
+    # Measured across four human-driven rounds, 11974 samples (record_drive.py
+    # --analyse): 0.0160 m/s per percent of duty, so 1.12 m/s at 70%. An
+    # earlier inch-test figure of 0.003 was taken while the drive gear was
+    # slipping and was five times too low.
+    speed_per_pct: 0.0160
+    # A pulsed car at 0.2 m/s takes far longer round a corner than a
+    # continuously driven one at 0.5 m/s.
+    # BNO055 NDOF heading grows clockwise; this file's convention is the other
+    # way. Confirmed on the car.
+    imu_sign_init: -1.0
+    min_move_pct: 66.0
+    pulse_enable: true
+    pulse_straights: true
+    # Deliberately slower than the human drove. The recorded rounds are a
+    # reference for WHERE the car should be and WHEN it should turn, not for
+    # how fast: a person anticipates a corner they can see coming, and this
+    # controller only reacts to what a sensor has already reported. 0.20 m/s
+    # against the human's 1.3 m/s buys the reaction time that difference costs.
+    pulse_period_s: 0.75
+    pulse_on_s: 0.14
+
+    # Corner geometry.  This chassis steers 25 deg on a 0.15 m wheelbase, so
+    # its tightest arc is 0.32 m; a corner between 0.6 m corridors needs 0.19 m
+    # and is taken as a three-point turn instead.  Raising max_steer_deg only
+    # helps if the linkage and the firmware envelope allow it.
+    # Measured 2026-08-25 with tools/inch_test.py --trim: with the steering
+    # commanded to zero the car turned -5.9 deg over 0.329 m travelled
+    # (-17.8 deg/m), i.e. it pulled left.  For a bicycle model that is a
+    # standing steering offset of atan(L * dpsi/ds), so this cancels it.
+    # Re-measure after any change to the servo horn or the linkage.
+    trim_deg: 2.67
+
+    # Turning is driven by the mat's PRINTED CORNER LINES, in every round.
+    # They are found by colour alone and the trigger is an image-row test --
+    # "has the line reached the bottom of the view" -- so it needs no camera
+    # height, pitch or field of view, and it does not care how wide this
+    # round's corridors are.  Front range stays as a backstop only, so the car
+    # still turns if it somehow misses a line.
+    # The corner is where the two side ultrasonics diverge: both short and
+    # equal down a corridor (S and S), one opening up at the corner (S and L),
+    # and the long side is the way out. No line, no colour, no camera
+    # calibration involved.
+    corner_source: "sides"
+    corner_asym_m: 0.30
+    corner_asym_s: 0.10
+    line_trigger_v: 0.72
+    line_arm_v: 0.45
+
+    # The camera's absolute distances are NOT trusted on this car: they read
+    # about half of what the lidar and the ultrasonics agree on, and no single
+    # mounting explains it (see README, "Status"). Lane centring therefore runs
+    # on lidar + ultrasonics, while the camera does what it is reliably good at
+    # -- the coloured lines, and the pillars in the obstacle round. The camera's
+    # HEADING is still used: a wall's slope is scale-free, so it survives a
+    # wrong height.
+    use_vision_ranges: false
+
+    # Sides are the ultrasonics', front is shared with the lidar. The lidar
+    # cannot see these glossy walls edge-on -- it reads long or not at all --
+    # and feeding that into the centring is what made the car ride one wall
+    # instead of holding the middle.
+    use_lidar_sides: false
+
+    # The map is a last-resort guard against driving into a wall the forward
+    # sensors cannot see, NOT a path planner. Veto only an arc that would
+    # actually put the body into something (margin 0), and use the radius the
+    # car really turns at this speed -- measured at about 85 deg/s while doing
+    # 0.23 m/s, which is roughly 0.15 m, so 0.35 m is already conservative.
+    # At 0.9 m and a 0.10 m margin it refused every corner in a 0.87 m
+    # corridor, because no such arc fits.
+    map_turn_radius_m: 0.35
+    map_arc_margin_m: 0.0
+
+    # Fitted to four human-driven rounds (tools/fit_policy.py). The driver
+    # committed to a corner with the wall 0.81 m ahead, with a corner line in
+    # view 9 times out of 10.
+    turn_at_m: 0.81
+
+    # This track is NOT four square corners: the inner block is small and
+    # off-centre, so a lap is a rounded loop and the driver swung 65 deg per
+    # corner, not 90. Asking for 90 here is what drove the car into the outer
+    # wall on the way out of every turn -- it kept rotating after it was
+    # already pointed down the new corridor.
+    turn_angle_deg: 65.0
+    turn_max_sweep_deg: 85.0
+    # NOT the 1.0 s the human held the stick for. This car's real turning
+    # radius is about 1.0 m against the 0.35 m a corner wants, so it takes the
+    # corner in several bites with reverses between them, and the whole
+    # manoeuvre is what this bounds. At 3 s it was aborting corners that were
+    # part way through and leaving the car pointed at a wall.
+    max_turn_s: 16.0
+    min_turn_s: 0.4
+    # Each bite has to be worth taking: go closer before giving up, reverse for
+    # longer, and allow enough bites to actually come round.
+    recover_front_m: 0.28
+    recover_max_s: 2.2
+    max_recoveries: 14
+    tight_recoveries: 18
+
+    # Held on the straights by the human, and the corner was taken at the same
+    # duty; this drivetrain has no useful slow speed anyway.
+    sustain_pct: 78.0
+    turn_sustain_pct: 80.0
+    # Zero on this track. The bias exists because a regulation 0.6 m corner
+    # can only be taken by entering it from the outside, but these corners are
+    # open (corridor 0.87 m, and over 2 m at the corners themselves), so all it
+    # did was push the car against the outer wall for no gain.
+    corner_bias_m: 0.0
+    corner_bias_from_m: 0.0
+    # At 1.3 m/s this car needs about 0.4 m to stop once a sensor has seen
+    # something, so braking at 0.42 m arrived at the wall with it. Brake
+    # earlier AND go slower -- both, because neither alone is enough.
+    brake_m: 0.58
+    resume_m: 0.75
+    # Corridor measured at 0.87 m median (0.79 at the 5th percentile).
+    single_target_m: 0.43
+    tight_lane_m: 1.10
+    max_steer_deg: 25.0
+    # The human never held a proportional correction -- WASD is a digital
+    # input, so the recorded steering is only ever 0 or full lock and no
+    # centring gain can be fitted from it. These stay hand-set and are
+    # validated in simulation instead of being claimed as measured.
+    # Hold the middle harder. With both walls in range the law is
+    # steer = kp/2 * (right - left), so 60 gives 30 deg per metre of offset --
+    # a 10 cm error off centre is corrected with 3 deg, which this car's
+    # steering (verified at ~85 deg/s at full lock) acts on immediately.
+    centre_kp: 60.0
+    centre_max_deg: 18.0
+    centre_kd: 6.0
+    # Start pushing away from a wall well before it is an emergency.
+    wall_min_m: 0.26
+    wall_push_deg: 22.0

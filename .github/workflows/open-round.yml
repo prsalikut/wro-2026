@@ -1,0 +1,66 @@
+# Open-round regression suite.
+#
+# The driver is validated by simulating whole rounds against a rendered camera
+# feed, which is embarrassingly parallel across configurations but far too slow
+# to run exhaustively on a laptop.  Sharding it across runners turns a
+# twenty-minute sweep into a couple of minutes, and makes every push carry the
+# evidence that the car still completes three laps.
+name: open round
+
+on:
+  push:
+    paths:
+      - 'src/ros2-package/sign_detector/sign_detector/**'
+      - 'src/tools/sim_*.py'
+      - 'src/tests/**'
+      - '.github/workflows/open-round.yml'
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 'Randomised rounds to simulate in total'
+        default: '2000'
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet numpy opencv-python-headless
+      - name: unit tests
+        run: python src/tests/test_open_round.py
+      - name: geometry self-test
+        run: python src/ros2-package/sign_detector/sign_detector/ground_geometry.py
+
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet numpy opencv-python-headless
+      - name: named configurations
+        run: python src/tools/sim_offline.py --sweep --seconds 175
+
+  stress:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --quiet numpy opencv-python-headless
+      - name: randomised rounds, shard ${{ matrix.shard }}
+        env:
+          TOTAL: ${{ github.event.inputs.rounds || '2000' }}
+        run: |
+          python src/tools/sim_offline.py --random $((TOTAL / 20)) \
+            --seed-base $(( ${{ matrix.shard }} * 100000 )) --seconds 175

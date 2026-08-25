@@ -21,8 +21,8 @@ non-zero angle, this node decays the command to center itself.
 
 Subscribes:  steering_cmd   std_msgs/Float32   (signed degrees, + = right)
              drive_cmd      std_msgs/Float32   (signed percent, + = forward)
-Params:      port, baud, steer_dir, max_deg, rate_limit_dps, cmd_timeout_s,
-             drive_max_pct, center_on_shutdown
+Params:      port, baud, steer_dir, drive_dir, max_deg, rate_limit_dps,
+             cmd_timeout_s, drive_max_pct, center_on_shutdown
 """
 import json
 import math
@@ -54,6 +54,7 @@ class SteeringBridge(Node):
             ("port", "auto"),
             ("baud", 115200),
             ("steer_dir", 1.0),
+            ("drive_dir", 1.0),
             ("max_deg", 25.0),
             ("rate_limit_dps", 0.0),
             ("cmd_timeout_s", 1.0),
@@ -62,6 +63,12 @@ class SteeringBridge(Node):
         ])
         g = self.get_parameter
         self.steer_dir = float(g("steer_dir").value)
+        # Same idea as steer_dir, for the traction motor. Measured on this car
+        # 2026-08-25 with tools/inch_test.py: commanding +70% made the front
+        # lidar range GROW, i.e. the car reversed. One flip here keeps the
+        # convention "+ = forward" everywhere upstream, instead of every caller
+        # having to know.
+        self.drive_dir = float(g("drive_dir").value)
         self.max_deg = float(g("max_deg").value)
         self.rate_limit = float(g("rate_limit_dps").value)
         self.cmd_timeout = float(g("cmd_timeout_s").value)
@@ -131,6 +138,7 @@ class SteeringBridge(Node):
                 self.get_logger().error("non-finite drive_cmd rejected")
                 self._nan_warn_time = now
             return
+        val *= self.drive_dir
         self.drive_cmd = max(-self.drive_max, min(self.drive_max, val))
         self.last_drive_cmd_time = self._now()
 

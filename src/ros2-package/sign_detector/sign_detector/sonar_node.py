@@ -43,7 +43,7 @@ class SonarNode(Node):
         self.started = False
         # One USON at startup, not per-reading: every arduino_cmd opens a manual
         # window in the bridge, which suspends autonomy while it is open.
-        self.create_timer(2.0, self.ensure_stream)
+        self.create_timer(1.0, self.ensure_stream)
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9

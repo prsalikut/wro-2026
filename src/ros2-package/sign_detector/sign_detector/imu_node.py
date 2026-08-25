@@ -107,15 +107,20 @@ class BNO055:
         self.fd = os.open(bus, os.O_RDWR)
         try:
             fcntl.ioctl(self.fd, I2C_SLAVE, addr)
-            who = self._read(self.CHIP_ID, 1)[0]
-            if who != 0xA0:
-                raise RuntimeError("not a BNO055 (CHIP_ID 0x%02x)" % who)
+            if not self._await_chip(2.0):
+                raise RuntimeError("no BNO055 answering at 0x%02x" % addr)
             self._write(self.PAGE_ID, 0x00)
             self._write(self.OPR_MODE, self.MODE_CONFIG)
             time.sleep(0.03)
             self._write(self.SYS_TRIGGER, 0x20)  # reset
-            time.sleep(0.7)
+            # The chip is off the bus for roughly 650 ms while it reboots, and
+            # a fixed sleep is a guess: too short and every transfer after it
+            # fails, which is exactly how this sensor came to be written off as
+            # dead. Wait for it to answer instead.
+            time.sleep(0.65)
             fcntl.ioctl(self.fd, I2C_SLAVE, addr)
+            if not self._await_chip(2.0):
+                raise RuntimeError("BNO055 did not come back after reset")
             self._write(self.PWR_MODE, 0x00)
             time.sleep(0.02)
             self._write(self.SYS_TRIGGER, 0x00)
@@ -127,12 +132,48 @@ class BNO055:
             self.close()
             raise
 
+    # The BNO055 stretches the I2C clock, and the Pi's controller does not
+    # handle that well: the first transaction after an idle period fails with
+    # EREMOTEIO and the very next one succeeds. Measured on this car -- a bare
+    # probe failed, then CHIP_ID returned 0xa0 on the second attempt. Retrying
+    # is the whole difference between "no IMU" and a working heading reference,
+    # so every transfer goes through these.
+    RETRIES = 8
+    RETRY_S = 0.006
+
+    def _await_chip(self, timeout_s):
+        """Poll CHIP_ID until the device answers with 0xA0, or give up."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                if self._read(self.CHIP_ID, 1)[0] == 0xA0:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.05)
+        return False
+
     def _write(self, reg, val):
-        os.write(self.fd, bytes([reg, val]))
+        last = None
+        for _ in range(self.RETRIES):
+            try:
+                os.write(self.fd, bytes([reg, val]))
+                return
+            except OSError as exc:
+                last = exc
+                time.sleep(self.RETRY_S)
+        raise last
 
     def _read(self, reg, n):
-        os.write(self.fd, bytes([reg]))
-        return os.read(self.fd, n)
+        last = None
+        for _ in range(self.RETRIES):
+            try:
+                os.write(self.fd, bytes([reg]))
+                return os.read(self.fd, n)
+            except OSError as exc:
+                last = exc
+                time.sleep(self.RETRY_S)
+        raise last
 
     @staticmethod
     def _s16(lo, hi):
@@ -214,19 +255,29 @@ class ImuNode(Node):
         self.last = self.t0
 
     def _probe(self):
+        # Report BOTH failures. Reporting only the second one meant a BNO055
+        # that was present but mis-initialising showed up as the MPU6050's
+        # "nothing at 0x68", which sent the diagnosis in the wrong direction
+        # for a long time.
+        bno_err = mpu_err = None
         try:
             self.dev = BNO055(self.bus, BNO055_ADDR)
             self.kind = "bno055"
-        except Exception:
+        except Exception as exc:
+            bno_err = exc
             try:
                 self.dev = MPU6050(self.bus, self.addr,
                                    self.gyro_range, self.dlpf)
                 self.kind = "mpu6050"
-            except Exception as exc:
+            except Exception as exc2:
+                mpu_err = exc2
                 if not self.absent_logged:
                     self.get_logger().warning(
-                        "no IMU ({}); probing every {:.0f} s".format(
-                            exc, PROBE_PERIOD_S))
+                        "no IMU; probing every {:.0f} s. BNO055 at 0x{:02x}: "
+                        "{}: {}. MPU6050 at 0x{:02x}: {}: {}".format(
+                            PROBE_PERIOD_S, BNO055_ADDR,
+                            type(bno_err).__name__, bno_err,
+                            self.addr, type(mpu_err).__name__, mpu_err))
                     self.absent_logged = True
                 return
         self.absent_logged = False
