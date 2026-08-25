@@ -108,8 +108,13 @@ def generate_launch_description():
             respawn=True, respawn_delay=2.0,
         ),
 
+        # Camera lane perception for the open round: wall distances, the car's
+        # heading relative to the corridor, and the coloured corner lines with a
+        # range attached.  It publishes line_event itself, which is why the old
+        # line_detector node is no longer started -- two publishers on that
+        # topic would double-count every corner.  See README, "Perception".
         Node(
-            package='sign_detector', executable='line_detector', name='line_detector',
+            package='sign_detector', executable='wall_vision', name='wall_vision',
             parameters=[cfg],
             output='screen',
             respawn=True, respawn_delay=2.0,

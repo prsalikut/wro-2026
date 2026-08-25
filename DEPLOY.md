@@ -62,53 +62,92 @@ Override the address with `--host user@addr` or `PI_HOST`.
     ssh pi@100.115.88.108 "docker exec signstack bash -lc \
       'source /opt/ros/humble/setup.bash && ros2 topic echo /sonar/left --once'"
 
-## 5. Known follow-ups
+## 5. Calibrate the camera FIRST
 
+The open round now drives on the camera. Everything it reports is a distance derived from
+where the wall meets the mat, so it is only as good as three numbers that have never been
+measured on this car -- lens height, pitch and field of view. The values in `params.yaml`
+are placeholders, and the bench frames suggest the lens may sit near level rather than
+pitched down.
+
+    # inside the container, on the Pi
+    python3 /ros2_ws/src/sign_detector/tools/vision_calib.py --fit
+    python3 /ros2_ws/src/sign_detector/tools/vision_calib.py --hfov --left 0.42 --right 0.55
+    python3 /ros2_ws/src/sign_detector/tools/vision_calib.py --check
+
+`--fit` needs no tape measure: point the car at a wall, capture, move it, capture again,
+five or six distances between 0.3 m and 1.5 m, and the lidar supplies the truth. `--hfov`
+needs one tape-measured pair of side distances. `--check` is read-only and compares the
+camera against the lidar and the sonars: **under 5 cm is good, over 15 cm means do not
+drive on it yet.**
+
+Paste the printed blocks into the `wall_vision:` section of `config/params.yaml` and
+redeploy.
+
+## 6. First runs, in this order
+
+1. **Dry run.** `drive_pct:=0` steers the servo but never turns the motor, so the car can be
+   pushed round the mat by hand while it thinks. The dashboard's "OPEN dry run" button does
+   this. Watch `open_status`:
+   - `direction` should lock within a metre or so, and match the round
+   - `turns` should tick exactly once per corner
+   - `health` should stay empty -- anything in it names a sensor that is lying
+   - `vision_ok` should stay true; `tight` should appear only in narrow corridors
+2. **Driven, reduced duty.** `drive_pct:=35`, one lap, ready to hit the e-stop.
+3. **Full round** on the button.
+
+## 7. Known follow-ups
+
+- **The camera mounting is unmeasured** -- see section 5. Highest priority.
+- **A 600 mm corridor cannot be cornered in one arc.** 25 deg of steering on a 0.15 m
+  wheelbase gives 0.32 m; the corner needs 0.19 m. The driver reverses and takes a second
+  bite, which works and is legal (9.21), but costs a few seconds per corner. Opening the
+  steering up would remove the need: the firmware envelope allows about 27 deg today
+  (+/-650 us at 24 us/deg), and ~38 deg would need a linkage change too.
 - **Right and front sonar read wrong (2026-08-23, measured on hardware).**
   Right sat at exactly 0.43 m for 213 consecutive samples while the lidar put
   the nearest object on that side at 2.94 m. Front read ~0.93-1.47 m against a
-  lidar front of 2.27 m -- under `turn_m` (1.10), so the car believes it is at a
-  corner permanently, turns into the wall, and `reverse_enable` backs it into
-  the wall behind. Reseat ECHO on A1 (right) and A0 (front) with 5V/GND, or swap
-  the sensors. Order is front/right/rear/left = A0/A1/A2/A3.
-- **`open_round` has no start gate.** It does not subscribe to `start_status`,
-  so it drives the instant it launches and the START button does nothing for the
-  open round. WRO requires starting on a button press; this needs fixing before
-  a competition run.
-- **`angle_offset_deg` (170.0) is unverified on the track.** If it is wrong the
-  chassis frame is rotated, "front" is not front, and the car halts and reverses
-  against a wall it thinks is ahead. Confirm before trusting a round: sweep
-  candidate offsets and pick the one where front is the largest open gap and
+  lidar front of 2.27 m. Reseat ECHO on A1 (right) and A0 (front) with 5V/GND,
+  or swap the sensors. Order is front/right/rear/left = A0/A1/A2/A3.
+  *The driver now survives both faults* -- `range_fusion` demotes a channel that stops
+  changing or that disagrees with the others, and says so in `open_status.health` -- but
+  the car is better off with four working sonars than three.
+- **`angle_offset_deg` (170.0) is unverified on the track.** It defines where the lidar
+  thinks forward is. The camera no longer depends on it, so a wrong value is far less
+  dangerous than it was, but the lidar's contribution stays wrong until it is checked:
+  sweep candidate offsets and pick the one where front is the largest open gap and
   left/right are roughly equal.
 - IMU does not respond (`Errno 121` on I2C). Check S0 and S1 are each bridged to
-  GND for address 0x28. Heading hold and gyro corners stay off without it.
-
+  GND for address 0x28. Corners fall back to the camera's alignment cue plus dead
+  reckoning without it, which the simulator covers.
 - `start_button` defaults to `gpiochip4`; if the button never reads, try
   `gpiochip0`. Needs `lgpio` or `python3-libgpiod` in the container.
 - `sonar` sends one `USON` at startup. Every `arduino_cmd` opens a manual window
   in the bridge which suspends autonomy, so it must stay one-shot, never polled.
-- The bridge's `RAW_ALLOWED` whitelist lives in the Pi's newer `steering_node.py`
-  (not the repo copy). `USON`/`USOFF` may need adding there, and read-only verbs
-  (`PING`, `GET`, `US`) should be exempted from opening a manual window.
-### Sensor roles (complementary, not a fallback chain)
+- **`sign_detector_node` publishes camera-frame poses labelled `base_link`** (its own
+  `_fuse` docstring says camera frame; `frame_id` is set to `base_link`). That is an
+  obstacle-round bug, untouched by this work, and worth fixing before the obstacle rounds.
 
-| Sensor | Role | Degrades to |
-|---|---|---|
-| Ultrasonic L/R | trusted side range, larger fusion weight | lidar side, if credible |
-| Lidar | front distance, corner detection, obstacle round | sonar front guard |
-| IMU | heading reference: 90 deg corner exit, heading hold | error-derivative damping |
+### Sensor roles (three witnesses, not a fallback chain)
 
-`_fuse_side` weights sonar 0.7 against lidar 0.3 when the two agree within
-`fuse_tol_m` (0.22). Beyond that it flags a disagreement and takes the sonar,
-because grazing incidence on glossy black is the known lidar failure and it
-reads long, never short. Disagreements are published in `open_status` — watch
-that field on the first runs, it is the fastest way to spot a mis-wired sensor.
+| Sensor | Role | Trust | Fails by |
+|---|---|---|---|
+| Camera | side distances, heading, corner lines, front | 1.3 | losing a wall outside a 60 deg lens; darkness |
+| Ultrasonic | side and front range, rear for reversing | 1.0 | latching at a constant value; reading short |
+| Lidar | front distance, corner confirmation, open-space vote | 0.7 | grazing incidence on glossy black |
 
-Front uses the NEAREST of lidar and sonar so either can stop the car.
+A fallback chain trusts a broken sensor until it goes silent, and a latched sonar never goes
+silent -- which is exactly how this car drove into a wall. So each source is tracked
+separately and demoted on *implausible behaviour* rather than absence: a value that never
+changes while the wheels turn, a value outside the physical range, or a value sitting
+outside what the others agree on for more than a second. What survives is combined by trust
+weight; disagreements are reported rather than averaged away.
 
-Each degrades independently: no IMU loses heading hold but keeps derivative
-damping from the ranges; no sonar falls back to lidar sides; no lidar keeps
-sonar centring and the sonar front guard.
+Decisions use the consensus, so one pessimistic sensor cannot stop the round. The brake uses
+the *nearest* healthy reading, so a wall only one sensor can see still stops the car.
+
+Watch `open_status.health` on the first runs. It names any channel that has been demoted and
+why, and it is the fastest way to spot a mis-wired sensor.
 
 ## What changed since the last working state
 

@@ -27,7 +27,12 @@ def _segments():
 
 SEGS = _segments()
 
-# orange = corner-entry line for CCW travel, blue = exit; CW crosses blue first
+# SUPERSEDED by tools/sim_field.py, which models the real mat.
+# WARNING: the colours below are the wrong way round, and the lines are
+# modelled as chords across the lane rather than the 30-degree radial
+# spokes the official artwork actually prints.  On the real mat a
+# CLOCKWISE car crosses ORANGE first at every corner.  Kept only so the
+# old range-only regression still runs; do not copy this table.
 LINES = [
     ("orange", (0.5, -1.5), (0.5, -0.5)), ("blue", (0.5, -0.5), (1.5, -0.5)),
     ("orange", (0.5, 0.5), (1.5, 0.5)), ("blue", (0.5, 0.5), (0.5, 1.5)),
