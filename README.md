@@ -30,9 +30,10 @@ This repository follows the WRO Future Engineers template structure.
 |---|---|
 | `src/ros2-package/` | The ROS 2 package deployed to the car — detectors, sensor fusion, driving nodes, the serial bridge, launch files, and the Docker build. **This is the deliverable.** |
 | `src/arduino/` | Firmware for the Arduino Nano (steering servo + BTS7960 traction motor), plus a flashing script. |
-| `src/tools/` | Host- and Pi-side utilities: the web dashboard / RC console, calibration helpers, frame grabbers, smoke tests. |
-| `schemes/` | Electromechanical wiring diagrams. |
-| `models/` | 3D-printed / laser-cut part files. |
+| `src/tools/` | Host- and Pi-side utilities: the web dashboard / RC console, calibration helpers, the offline simulator, survey and recording scripts, deploy and round-runner shells. |
+| `src/tests/` | Unit tests for the driving core. No ROS required: `python3 src/tests/test_open_round.py`. |
+| `.github/workflows/` | CI — unit tests, the named-configuration sweep, and a 20-way sharded randomised-round stress run on every push. |
+| `schemes/` | Electromechanical wiring: parts list and connection tables. |
 | `t-photos/`, `v-photos/`, `video/` | Team photos, vehicle photos, driving demonstration video. |
 | `other/dataset/` | YOLO-format dataset auto-labelled from practice photos (164 labelled boxes: 86 red, 78 green). |
 | `other/prototyping/` | Colab notebook and standalone experiments used while developing the detector. |
@@ -90,6 +91,18 @@ independent watchdog that stops the motor if the Pi stops talking.
 - **`ground_geometry.py`** — the pixel ↔ ground-plane mapping everything above rests on.
   Pure maths, no ROS, with a self-test: `python3 ground_geometry.py`.
 
+- **`local_map.py`** — a short-memory map of the walls, and the answer to a failure
+  that reacting faster cannot fix. The forward sensors point where the car is *aimed*, not
+  where its curving path is *going*, so turning into a corner swings them onto a wall that
+  was never in front of the car until it was — recorded on this vehicle as a front range
+  sitting near a metre and then reading six centimetres in one sample. There was nothing to
+  react to. But the car *saw* that wall a second earlier, off to the side, and forgot it.
+  Every ultrasonic reading is now dropped into a small world-frame map using IMU heading and
+  drive odometry, so the core can ask what is inside the arc it is about to drive through.
+  Deliberately short-lived — a point is trusted for a few seconds and a few metres, long
+  enough to remember the wall you are turning into, short enough that dead-reckoning drift
+  never accumulates. Pure Python, no ROS and no numpy.
+
 - **`range_fusion.py`** — combines camera, lidar and sonar per axis and, more importantly,
   notices when one of them is lying. Absence is not the test, because a latched sonar never
   goes silent: a channel is demoted when its value stops changing while the car is moving,
@@ -141,6 +154,12 @@ independent watchdog that stops the motor if the Pi stops talking.
   `wall_vision`, which reports a distance to each line rather than a bare "seen" flag and
   applies a saturation and chroma test the old value-only threshold did not. It is no longer
   started by `bringup.launch.py`; two publishers on `line_event` would double-count corners.
+- **`sim_open_round_node.py`** — an in-graph square-track simulator with a kinematic
+  bicycle model. **Superseded** by `tools/sim_field.py`, which renders the real mat and runs
+  the actual perception code against the pixels rather than against idealised ranges.
+- **`train_recorder_node.py`** — records human RC driving (raw scan, steering and drive
+  commands, IMU yaw rate) to JSONL, driven by `train_cmd` start/stop. The input side of the
+  gain-fitting loop that `tools/fit_policy.py` closes.
 - **`imu_node.py`** — BNO055 or MPU6050 over I²C, with hot-plug probing.
 - **`start_button_node.py`** — implements the WRO start procedure (rules 9.11/9.14):
   boot into a waiting state, first press starts the round, a later press stops it.
@@ -161,6 +180,13 @@ independent watchdog that stops the motor if the Pi stops talking.
   during normal operation, and it zeroes the motor if commands go stale for longer than
   `cmd_timeout_s`. A manual window suspends autonomous forwarding while the RC console is
   in use, so the two cannot fight over the actuators.
+- **`arduino_link.py`** — the plain-Python serial link underneath it, with **no ROS
+  dependency**, so the firmware can be exercised from a unit test or a bare CLI. Port
+  autodetect scans `/dev/serial/by-id/` and explicitly **skips the YDLIDAR's CP210x**, which
+  must never be opened, preferring an Arduino VID and then the FTDI Nano actually fitted.
+- **`steer_test.py`** — standalone steering CLI over that link, no ROS:
+  `python3 steer_test.py sweep` runs centre, +15°, −15°, centre and prints each firmware
+  reply. The fastest way to tell a wiring fault from a software one.
 
 ### Tools
 
@@ -177,8 +203,52 @@ independent watchdog that stops the motor if the Pi stops talking.
 - **`tools/viz_server.py`** — web dashboard on port 8080: live camera and LiDAR views, a
   pre-flight checklist, stack start/stop, an E-stop, and a gamepad RC console (`/rc`) used
   for manual driving.
+- **`tools/check_all.py`** — pre-flight. Subscribes to every sensor topic at once and
+  reports what is live, what is silent, and what is publishing nonsense. Read-only, so it is
+  safe with the car on the mat, and it exits non-zero unless every required component
+  passes, so it can gate a launch script.
+- **`tools/lidar_orient.py`** — solves `angle_offset_deg` by matching the *shape* of the
+  lidar's range profile against the calibrated camera's. An earlier version compared four
+  sector medians against the ultrasonics and could not tell; the sonars disagree with each
+  other on this car, and four numbers cannot pin an angle. This is hundreds of constraints
+  and does not involve the sonars at all. Read-only.
+- **`tools/collect_cal.py`** — solves the lidar's mounting from the IMU instead. A
+  stationary snapshot cannot settle offset *and* sign; rotation can, because a wall does not
+  move, so a heading change of X° must swing that wall by exactly −X° in the car's frame.
+  You turn the car by hand — nothing here commands the motor or the servo.
+- **`tools/inch_test.py`** — inches the car in small steps and checks whether the sensors
+  agree about how far it went. Settles two things a static check cannot: a camera-height
+  scale error (whatever the car actually travelled, lidar and camera must report the *same*
+  change) and how far one pulse of a drivetrain that will not move below ~30% duty actually
+  travels.
+- **`tools/inch_round.py`** — surveys a whole lap one short step at a time:
+  measure while stopped → decide → one pulse → stop. The car is stationary for every
+  decision and never carries speed into one, so the failure that wrecked the continuous
+  driver — braking distance longer than the distance it could see — cannot happen. `--analyse`
+  emits a `params.yaml` block of what the *real* track does. This is not how the round is
+  driven; it is how the numbers the round is driven on get measured.
+- **`tools/record_drive.py`** + **`tools/fit_policy.py`** — record a human-driven lap, then
+  fit the controller's gains to it. What these extract is a **control law** — steering per
+  unit of lane error, the front distance at which a corner really begins, the duty that
+  holds a straight — never a route: the layout is randomised after check time, so a
+  remembered path is against the spirit of rule 9.9 and useless on the day. Rule 13.18
+  explicitly grants calibration time, and a fitted gain is calibration in the same sense a
+  tape-measured wheelbase is.
+- **`tools/run_round.sh`** — runs one Open round tied to the life of the terminal. This is
+  not automatic and it matters: `docker exec` does **not** forward a hangup into the
+  container, so a round started the obvious way keeps driving after the operator's SSH
+  session has gone. Here Ctrl-C, a closed terminal or a dropped link all stop the car.
+  Defaults to a dry run (`--drive` to actually turn the motor).
+- **`tools/deploy.sh`** — pushes the package to the Pi, rebuilds in the container and runs
+  the sensor check. Every step is skippable so a failed run resumes rather than restarts.
 - **`tools/auto_calib.py`**, **`grab_frame.py`**, **`smoke_test.py`**, **`proxy.py`** —
-  calibration, single-frame capture, end-to-end checks, and a TCP proxy for remote access.
+  camera–LiDAR angle offset, single-frame capture, end-to-end checks, and a TCP proxy for
+  remote access.
+- **`tools/patch_viz_training.py`** — adds the training-record panel to the RC console by
+  patching the Pi's `viz_server.py` **in place**. The Pi's copy is ahead of this repo's and
+  carries RC work that was never committed, so shipping a replacement would delete it. Every
+  insertion is anchored on an existing line and it aborts without writing if an anchor is
+  missing, so a drifted file fails loudly. Idempotent.
 
 ### Firmware
 
@@ -299,11 +369,47 @@ widths from 0.5 m to 1.1 m, a frozen sonar, a sonar reading 0.9 m short, all fou
 dead, a lidar returning almost nothing, dim and bright and colour-cast lighting, three
 camera mountings, and a mat printed with the line colours swapped.
 
-### 10. Other checks
+### 10. Pre-flight, then drive a round
+
+Check every sensor at once before trusting a round. It is read-only and exits non-zero if
+anything required is silent or publishing nonsense, so it can gate the launch:
+
+```bash
+docker exec signstack bash -lc \
+  'source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && \
+   python3 /ros2_ws/src/sign_detector/tools/check_all.py'
+```
+
+Then run the round through `run_round.sh` rather than a bare `docker exec` — `docker exec`
+does not forward a hangup into the container, so a round started the obvious way **keeps
+driving after your terminal has gone**. This one dies with the terminal:
+
+```bash
+./src/tools/run_round.sh            # dry run: steers, motor never turns
+./src/tools/run_round.sh --drive    # drives at the configured duty
+```
+
+The Arduino's own watchdog is the backstop: if the bridge stops sending, the firmware cuts
+the motor about a second later even if everything above has failed.
+
+### 11. Other checks
 
 `src/tools/smoke_test.py` is the quick "is anything publishing?" check.
-`src/tools/auto_calib.py` re-derives the camera-LiDAR angle offset.
+`src/tools/lidar_orient.py` and `src/tools/collect_cal.py` solve the lidar's angular offset —
+against the camera and against the IMU respectively.
+`src/tools/inch_test.py` inches the car to check the sensors agree about how far it moved.
 `src/tools/grab_frame.py` grabs a single camera frame for offline inspection.
+`src/tools/steer_test.py`-equivalent for the servo alone is
+`sign_detector/steer_test.py sweep`, which needs no ROS.
+
+### Continuous integration
+
+`.github/workflows/open-round.yml` runs on every push that touches the driver, the
+simulator or the tests. Three jobs: the unit tests plus the `ground_geometry` self-test; the
+named-configuration sweep; and a randomised stress run of 2000 rounds **sharded 20 ways**,
+which turns a twenty-minute sweep into a couple of minutes and makes every push carry the
+evidence that the car still completes three laps. `workflow_dispatch` takes a `rounds` input
+to run it deeper on demand.
 
 ---
 
@@ -406,5 +512,6 @@ Per the WRO Future Engineers rules, still to be added:
 - [ ] `t-photos/` — official and funny team photos
 - [ ] `v-photos/` — six vehicle photos (front, back, left, right, top, bottom)
 - [ ] `video/video.md` — public link to the driving demonstration
-- [ ] `schemes/` — electromechanical wiring diagram
-- [ ] `models/` — 3D-printed / laser-cut part files
+- [x] `schemes/` — parts list and connection tables committed; a drawn wiring diagram
+      still to be added
+- [ ] `models/` — 3D-printed / laser-cut part files. **The folder does not exist yet.**
